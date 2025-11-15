@@ -24,6 +24,20 @@ libraryDependencies ++= Seq(
 )
 
 lazy val root = (project in file("."))
+  .enablePlugins(ScalabPlugin) // <-- 이 줄을 추가해 주세요
   .settings(
-    name := "332project"
+    name := "my-distributed-sort",
+    libraryDependencies ++= Seq(
+      // gRPC와 Protobuf (ScalaPB)
+      "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % "0.11.14",
+      "io.grpc" % "grpc-netty" % "1.58.0", // gRPC 서버/클라이언트 런타임
+      "com.google.protobuf" % "protobuf-java" % "3.25.1", // Protobuf 런타임
+
+      // 테스트
+      "org.scalatest" %% "scalatest" % "3.2.17" % Test
+    ),
+    // ScalaPB 플러그인 활성화 및 gRPC 코드 생성 설정
+    Compile / PB.targets := Seq(
+      scalapb.gen(grpc = true) -> (Compile / sourceManaged).value / "scalapb"
+    )
   )
