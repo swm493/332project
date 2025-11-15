@@ -1,13 +1,16 @@
-import SimpleSort.mergeSort
+import GenericInPlaceQuickSort.sort
 
-println("--- merge sort test ---")
+val testArray = Array(
+  Record(5, "apple"),
+  Record(1, "banana"),
+  Record(8, "cherry"),
+  Record(3, "date")
+)
 
-val unsortedList = List(5, 1, 8, 3, 10, 2, 7, 4, 9, 6)
-val sortedList = mergeSort(unsortedList)
-println(s"original: $unsortedList")
-println(s"result: $sortedList")
+implicit val recordOrdering: Ordering[Record] = Ordering.by(_.key)
 
-val unsortedList2 = List(100, 50, -5, 0, 10)
-val sortedList2 = mergeSort(unsortedList2)
-println(s"original: $unsortedList2")
-println(s"result: $sortedList2")
+println(s"원본 Array:\n  ${testArray.mkString("\n  ")}")
+
+sort(testArray)
+
+println(s"\n'key' 기준 정렬된 Array:\n  ${testArray.mkString("\n  ")}")
