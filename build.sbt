@@ -32,7 +32,11 @@ lazy val root = (project in file("."))
       case PathList("META-INF", "io.netty.versions.properties") =>
         MergeStrategy.discard
 
-      // 다른 META-INF 잡음 제거
+      // 💡 Service Provider Configuration 파일들은 합쳐야 함
+      case PathList("META-INF", "services", xs @ _*) =>
+        MergeStrategy.concat // 파일 내용을 합침 (새 줄로 연결)
+
+      // 💡 그 외 모든 META-INF 파일들은 버림 (잡음 제거)
       case PathList("META-INF", xs @ _*) =>
         MergeStrategy.discard
 
