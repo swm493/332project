@@ -181,7 +181,7 @@ class WorkerNode(
     // 2. K-way merge 수행
     // (project.sorting.2025.pptx - "partition.<n>")
     val finalOutputFile = new File(outputDir, "partition.0") // TODO: 파티션 번호 관리
-    StorageService.mergeSortFiles(receivedFiles, finalOutputFile)
+    // StorageService.mergeSortFiles(receivedFiles, finalOutputFile)
 
     // 3. 임시 파일 삭제
     StorageService.deleteTempFiles(receivedFiles)

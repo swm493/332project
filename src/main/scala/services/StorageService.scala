@@ -1,51 +1,46 @@
 package services
 
-import java.io._
+import java.io.*
 import scala.collection.mutable
-import scala.util.{Using, Try}
+import scala.collection.mutable.ListBuffer
+import scala.util.{Try, Using}
 
 object StorageService {
-  val RECORD_SIZE = 100
-  val KEY_SIZE = 10
-
-  /**
-   * [Phase 1: Sampling]
-   * 입력 파일에서 균등한 간격(Stride)으로 10바이트 키를 샘플링합니다.
-   * 파일 전체를 읽지 않고 RandomAccessFile을 사용하여 효율적으로 건너뛰며 읽습니다.
-   */
+  
   def extractSamples(file: File): List[Key] = {
-    if (!file.exists()) return List.empty
-
-    println(s"[Storage] Extracting samples from ${file.getName}...")
-    val samples = mutable.ListBuffer[Key]()
-
-    val fileSize = file.length()
-    val numRecords = fileSize / RECORD_SIZE
-
-    // 최대 1000개의 샘플을 추출한다고 가정
-    val targetSampleCount = 1000
-    // 전체 레코드 수가 1000개 이하면 모든 레코드를 샘플링, 아니면 간격을 둠
-    val stride = if (numRecords <= targetSampleCount) 1 else (numRecords / targetSampleCount).toInt
-    val loopCount = if (numRecords <= targetSampleCount) numRecords.toInt else targetSampleCount
-
-    Using(new RandomAccessFile(file, "r")) { raf =>
-      for (i <- 0 until loopCount) {
-        val pos = i.toLong * stride * RECORD_SIZE
-        if (pos < fileSize) {
-          raf.seek(pos)
-          val buffer = new Array[Byte](KEY_SIZE)
-          raf.read(buffer) // 키 부분만(10 bytes) 읽음
-
-          // Key 타입이 Array[Byte]이므로 복사본 저장 (안전성 위해 clone 권장되나 여기선 단순화)
-          samples += buffer.clone()
-        }
-      }
-    }.getOrElse {
-      println(s"[Storage] Failed to extract samples from ${file.getName}")
-      List.empty
+    if(!file.exists() || file.length() == 0){
+      return List.empty
     }
+    
+    val fis = new FileInputStream(file)
+    try {
+      val maxRecords = (file.length() / Constant.Size.record).toInt
+      val recordsToRead = math.min(Constant.Sample.n, maxRecords)
+      val bytesToRead = recordsToRead * Constant.Size.record
 
-    samples.toList
+      if (bytesToRead == 0) return List.empty
+      
+      val buffer = new Array[Byte](bytesToRead)
+      
+      val actualRead = fis.read(buffer)
+      
+      val keys = new ListBuffer[Key]()
+      var offset = 0
+      
+      while (offset + Constant.Size.key <= actualRead) {
+        val keyBytes = new Array[Byte](Constant.Size.key)
+        
+        System.arraycopy(buffer, offset, keyBytes, 0, Constant.Size.key)
+        
+        keys += keyBytes
+        
+        offset += Constant.Size.record
+      }
+
+      keys.toList
+    } finally {
+      fis.close()
+    }
   }
 
   /**
@@ -66,12 +61,12 @@ object StorageService {
       private def fetchNext(): Option[Array[Byte]] = {
         if (isClosed) return None
 
-        val buffer = new Array[Byte](RECORD_SIZE)
+        val buffer = new Array[Byte](Constant.Size.record)
         var totalRead = 0
 
         try {
-          while (totalRead < RECORD_SIZE) {
-            val read = bis.read(buffer, totalRead, RECORD_SIZE - totalRead)
+          while (totalRead < Constant.Size.record) {
+            val read = bis.read(buffer, totalRead, Constant.Size.record - totalRead)
             if (read == -1) {
               closeStream()
               return None
