@@ -33,9 +33,8 @@ object MasterApp {
     // gRPC 서버를 위한 스레드 풀
     val execContext = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(numWorkers + 1))
 
-    // (project.sorting.2025.pptx)
     // 포트는 하드코딩하지 않는 것이 좋으나, 예제 편의상 8080 사용
-    val port = 8080
+    val port = 1557
 
     val masterNode = new MasterNode(execContext, port, numWorkers)
     masterNode.start()

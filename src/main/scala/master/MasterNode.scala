@@ -35,6 +35,14 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
       val workerID = req.workerId
       logger.info(s"Worker $workerID registering...")
 
+      // TODO: 테스트용 출력 코드이므로 나중에 삭제
+      val parts = workerID.split(":")
+      if (parts.length == 2) {
+        val workerPort = parts(1)
+        // System.out.println 사용 시 gRPC 로그와 분리되어 출력됩니다.
+        System.out.println(s"Worker connected! Worker Port (임시 출력): $workerPort")
+      }
+
       // 동기화 블록으로 상태 관리
       val (assignedState, splittersToSend, workersToSend) = synchronized {
         if (!workerStatus.contains(workerID) || workerStatus(workerID) == Failed) {
@@ -139,7 +147,7 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
         if (workerStatus.values.forall(_ == Done)) {
           logger.info("--- All workers done. Distributed sorting complete! ---")
           // (선택적) 마스터 서버 종료
-          // stop() 
+          // stop()
         }
       }
 
