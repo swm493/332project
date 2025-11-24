@@ -21,6 +21,24 @@ object Constant {
   }
 }
 
+object RecordOrdering {
+  implicit val ordering: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {
+    override def compare(x: Array[Byte], y: Array[Byte]): Int = {
+      var i = 0
+      while (i < Constant.Size.key) {
+        val a = x(i) & 0xFF
+        val b = y(i) & 0xFF
+
+        if (a != b) {
+          return a - b
+        }
+        i += 1
+      }
+      0
+    }
+  }
+}
+
 // MasterNode.scala 프로토타입을 기반으로 한 워커 상태
 object WorkerState extends Enumeration {
   type WorkerState = Value
