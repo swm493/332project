@@ -15,6 +15,7 @@ object Constant {
     def key: Int = 10
     def value: Int = 90
     def record: Int = 100
+    def partitionPerWorker: Int = 10
   }
   object Sample {
     def n: Int = 1000
