@@ -20,6 +20,19 @@ object Constant {
     def n: Int = 1000
   }
 }
+object CompareKey {
+  // compareKey: Key(byte array) 비교 (unsigned 바이트 비교)
+   def compareKey(a: Key, b: Key): Int = {
+    val minLen = math.min(a.length, b.length)
+    var i = 0
+    while (i < minLen) {
+      val diff = (a(i) & 0xff) - (b(i) & 0xff)
+      if (diff != 0) return diff
+      i += 1
+    }
+    a.length - b.length
+  }
+}
 
 object RecordOrdering {
   implicit val ordering: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {

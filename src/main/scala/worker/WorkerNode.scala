@@ -4,9 +4,13 @@ import io.grpc.{ManagedChannel, ManagedChannelBuilder}
 
 import scala.collection.mutable.ListBuffer
 import java.io.File
+import java.io.{BufferedOutputStream, File, FileOutputStream}
+import java.util.concurrent.atomic.AtomicInteger
 import scala.util.{Failure, Success, Try}
 import services.WorkerState.*
 import services.{GrpcNetworkService, Key, NetworkService, StorageService, WorkerID, WorkerState}
+import services.CompareKey.compareKey
+import services.Constant
 // ScalaPB가 sorting.proto로부터 생성할 코드들
 import sorting.sorting._
 
@@ -118,6 +122,34 @@ class WorkerNode(
     println(s"Registered. Initial state: $state")
   }
 
+  private def findTargetWorker(key: Key, splitters: List[Key]): WorkerID = {
+    if (allWorkerIDs == null || allWorkerIDs.isEmpty) {
+      throw new IllegalStateException("allWorkerIDs is not initialized")
+    }
+
+    // 파티션 수 = allWorkerIDs.length
+    // splitters.length == partitions - 1 (정상적이면)
+    var left = 0
+    var right = splitters.length - 1
+    var pos = splitters.length // 기본: 마지막 파티션
+
+    while (left <= right) {
+      val mid = (left + right) >>> 1
+      val cmp = compareKey(key, splitters(mid))
+      if (cmp <= 0) {
+        pos = mid
+        right = mid - 1
+      } else {
+        left = mid + 1
+      }
+    }
+
+    // pos는 'key <= splitter(pos)'인 첫 인덱스, 그러므로 파티션 인덱스 = pos
+    // 예: pos == 0 => partition 0, pos == splitters.length => partition splitters.length (마지막 파티션)
+    val partitionIndex = math.min(pos, allWorkerIDs.length - 1)
+    allWorkerIDs(partitionIndex)
+  }
+
   // [보조 함수] Heartbeat로 상태 업데이트
   private def pollHeartbeat(): Unit = {
     val reply = masterClient.heartbeat(HeartbeatRequest(workerId = workerID))
@@ -178,45 +210,133 @@ class WorkerNode(
     this.state = Shuffling
   }
 
-  // (worker.scala - executeShuffleAndPartition)
   private def executeShuffleAndPartition(): Unit = {
     println("Phase: Shuffling")
 
-    // 1. 워커 간 네트워크 서비스 시작 (gRPC 서버 시작)
-    // (worker.scala - startReceivingData)
+    if (splitters == null || allWorkerIDs == null) {
+      throw new IllegalStateException("splitters or allWorkerIDs is null")
+    }
+
+    val myIndex = allWorkerIDs.indexOf(workerID)
+    if (myIndex == -1) {
+      throw new IllegalStateException(s"workerID $workerID not found in allWorkerIDs")
+    }
+
+    // --- 준비: 파일/스트림 ---
+    val localTempFile = new File(outputDir, s"shuffle-local-$myIndex.tmp")
+    localTempFile.getParentFile.mkdirs()
+    val localBos = new BufferedOutputStream(new FileOutputStream(localTempFile, true), 64 * 1024)
+
+    val recvTempFile = new File(outputDir, s"shuffle-recv-$myIndex.tmp")
+    recvTempFile.getParentFile.mkdirs()
+    val recvBos = new BufferedOutputStream(new FileOutputStream(recvTempFile, true), 64 * 1024)
+
+    // recvBos는 network 콜백에서 사용되므로 동기화 락 필요
+    val recvLock = new Object()
+
+    // 안전하게 여러 번 startReceivingData 호출되지 않게 기존 있으면 shutdown 먼저
+    if (networkService != null) {
+      try {
+        networkService.shutdown()
+      } catch {
+        case _: Throwable => ()
+      }
+    }
+
+    // 네트워크 수신 콜백: 들어오는 레코드를 recvTempFile에 append
     networkService = new GrpcNetworkService(allWorkerIDs, workerID)
-    networkService.startReceivingData(onDataReceived = (record: Array[Byte]) => {
-      // TODO: 받은 레코드를 outputDir의 임시 파일에 저장
-      // (이 콜백은 다른 스레드에서 실행될 수 있음)
-      // println("Received shuffle data (stub)")
-    })
-
-    // 2. 모든 입력 파일을 다시 읽음
-    // (worker.scala - readRecords)
-    for (dir <- inputDirs) {
-      for (file <- StorageService.listFiles(dir)) {
-        for (record <- StorageService.readRecords(file)) { // 100바이트 레코드
-          val key = record.take(10) // 10바이트 키
-
-          // 3. 키에 맞는 워커 찾기
-          val targetWorkerID = findTargetWorker(key, splitters)
-
-          if (targetWorkerID == workerID) {
-            // TODO: 자신의 데이터는 로컬 임시 파일에 바로 저장
-          } else {
-            // 4. 키에 맞는 워커에게 데이터 전송 (Shuffle)
-            // (worker.scala - sendDataTo)
-            networkService.sendData(targetWorkerID, record)
-          }
+    networkService.startReceivingData { (record: Array[Byte]) =>
+      // 기록은 다른 스레드에서 호출될 수 있으므로 동기화
+      recvLock.synchronized {
+        try {
+          recvBos.write(record)
+        } catch {
+          case e: Exception =>
+            println(s"[Worker $workerID] Error writing received record: ${e.getMessage}")
         }
       }
     }
 
-    // 5. 데이터 전송 완료 신호 및 수신 대기
-    // (worker.scala - finishSendingData / waitForReceivingData)
-    networkService.finishSending()
-    networkService.awaitReceivingCompletion()
-    networkService.shutdown() // 셔플용 네트워크 종료
+    // 송신 중 고유 시퀀스(디버깅/로그 목적)
+    val sendCounter = new AtomicInteger(0)
+
+    try {
+      // --- 입력 파일 순회 및 분배 ---
+      for (dir <- inputDirs) {
+        for (file <- StorageService.listFiles(dir)) {
+          val it = StorageService.readRecords(file)
+          while (it.hasNext) {
+            val record = it.next()
+            if (record.length < Constant.Size.key) {
+              // 안전장치: 키가 부족하면 건너뜀
+              println(s"[Worker $workerID] Skipping short record in ${file.getName}")
+            } else {
+              val key = record.take(Constant.Size.key)
+              val target = findTargetWorker(key, splitters)
+
+              if (target == workerID) {
+                // 로컬 파티션에 바로 기록
+                localBos.write(record)
+              } else {
+                // 원격으로 전송 (networkService 구현에 의해 비동기 전송)
+                try {
+                  networkService.sendData(target, record)
+                  val cnt = sendCounter.incrementAndGet()
+                  if ((cnt & 0xfff) == 0) { // 주기적 로그 (매 4096건)
+                    println(s"[Worker $workerID] Sent $cnt records so far...")
+                  }
+                } catch {
+                  case e: Exception =>
+                    println(s"[Worker $workerID] Failed to send to $target: ${e.getMessage}")
+                  // 전송 실패 정책: 현재는 로깅 후 계속 (필요시 재시도 로직 추가)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // --- 송신 종료 및 수신 완료 대기 ---
+      localBos.flush()
+
+      // 네트워크 서비스에 송신이 끝났음을 알림
+      networkService.finishSending()
+
+      // 수신이 끝날 때까지 대기 (GrpcNetworkService가 내부적으로 완료 플래그를 세움)
+      networkService.awaitReceivingCompletion()
+
+      // 수신 스트림 플러시/닫기 (동기화)
+      recvLock.synchronized {
+        recvBos.flush()
+        recvBos.close()
+      }
+      localBos.close()
+
+      println(s"[Worker $workerID] Shuffle + Partition complete. Sent ${sendCounter.get()} records.")
+    } catch {
+      case e: Exception =>
+        // 안전하게 닫기
+        try {
+          localBos.close()
+        } catch {
+          case _: Throwable => ()
+        }
+        try {
+          recvLock.synchronized {
+            recvBos.close()
+          }
+        } catch {
+          case _: Throwable => ()
+        }
+        throw e
+    } finally {
+      // 네트워크 서비스는 셧다운(혹은 이후 단계에서 재사용 불가하면 shutdown)
+      try {
+        networkService.shutdown()
+      } catch {
+        case _: Throwable => ()
+      }
+    }
   }
 
   // (worker.scala - executeMerge)
@@ -233,16 +353,5 @@ class WorkerNode(
 
     // 3. 임시 파일 삭제
     StorageService.deleteTempFiles(receivedFiles)
-  }
-
-  // (내부) 키를 기반으로 타겟 워커 ID를 찾습니다.
-  private def findTargetWorker(key: Key, splitters: List[Key]): WorkerID = {
-    // TODO:
-    // 1. splitters (정렬되어 있음)와 key 비교
-    // 2. key가 속하는 범위(파티션) 찾기
-    // 3. 해당 파티션을 담당하는 workerID 반환 (allWorkerIDs 리스트의 인덱스)
-
-    // (임시 스텁: 첫 번째 워커에게 모두 전송)
-    allWorkerIDs.head
   }
 }
