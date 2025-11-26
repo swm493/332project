@@ -1,15 +1,19 @@
 package master
 
 import io.grpc.{Server, ServerBuilder}
+
 import scala.concurrent.{ExecutionContext, Future}
 import java.util.logging.Logger
-import scala.collection.mutable.{Map => MutableMap}
-
-import services.WorkerState._
+import scala.collection.mutable.{ListBuffer, Map as MutableMap}
+import services.WorkerState.*
 import services.{Key, WorkerID}
+
+import scala.collection.mutable
 // ScalaPB가 sorting.proto로부터 생성할 코드들
 import sorting.sorting._
 import com.google.protobuf.ByteString
+
+import services.RecordOrdering.ordering
 
 /**
  * MasterNode는 gRPC 서비스 (SortingService)를 구현합니다.
@@ -22,8 +26,8 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
 
   // --- Master의 상태 관리 ---
   // (MasterNode.scala 프로토타입의 변수들)
-  private val workerStatus = MutableMap[WorkerID, WorkerState]()
-  private val workerSamples = MutableMap[WorkerID, List[Key]]()
+  private val workerStatus = mutable.Map[WorkerID, WorkerState]()
+  private val workerSamples = mutable.Map[WorkerID, List[Key]]()
   @volatile private var globalSplitters: List[Key] = null
   @volatile private var allWorkerIDs = List[WorkerID]()
 
@@ -194,17 +198,18 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
 
   // (내부) 스플리터 계산 (MasterNode.scala - calculateSplitters)
   private def calculateSplitters(): Unit = {
-    // TODO:
-    // 1. 모든 샘플(workerSamples.values.flatten) 수집
-    // 2. 샘플 정렬 (Key 비교 로직 필요)
-    // 3. numWorkers - 1 개의 스플리터 선택
 
-    // (임시 스텁)
-    globalSplitters = List(Array.fill[Byte](10)(50)) // '2'
+    val pivotN = (numWorkers * services.Constant.Size.partitionPerWorker) - 1
+    val allSamples = workerSamples.values.flatten.toArray
 
-    if (globalSplitters.isEmpty && numWorkers > 1) {
-      logger.warning("Calculated 0 splitters, which might be incorrect for >1 workers.")
-    }
+    val splitSize: Int = allSamples.length / (pivotN + 1)
+    val splitters: ListBuffer[Key] = ListBuffer.empty
+
+    java.util.Arrays.sort(allSamples, ordering)
+
+    for(i <- 1 to pivotN) splitters += allSamples(i * splitSize - 1)
+
+    globalSplitters = splitters.toList
   }
 
   // (내부) 워커 실패 감지 (MasterNode.scala - detectWorkerFailure)
