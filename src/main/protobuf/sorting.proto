@@ -40,6 +40,25 @@ message NotifyReply {
   bool ack = 1;
 }
 
+message HeartbeatRequest {
+  string worker_id = 1;
+}
+
+message HeartbeatReply {
+  enum WorkerState {
+    Unregistered = 0;
+    Sampling = 1;
+    Shuffling = 2;
+    Merging = 3;
+    Done = 4;
+    Failed = 5;
+    Waiting = 6;
+  }
+  WorkerState state = 1;
+  repeated ProtoKey splitters = 2;
+  repeated string all_worker_ids = 3;
+}
+
 /**
  * MasterNode가 구현할 Master-Worker 간 gRPC 서비스
  * (master.scala 프로토타입의 RPC 호출들을 기반으로 정의)
@@ -47,6 +66,9 @@ message NotifyReply {
 service SortingService {
   // 워커가 마스터에 등록 (master.scala, worker.scala)
   rpc RegisterWorker (RegisterRequest) returns (RegisterReply);
+
+  // 워커의 상태 수신
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
 
   // 워커가 샘플 제출 (master.scala)
   rpc SubmitSamples (SampleRequest) returns (SampleReply);

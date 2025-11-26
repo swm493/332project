@@ -5,7 +5,6 @@ import scala.collection.mutable.ListBuffer
 
 /**
  * WorkerApp: 워커를 실행하는 메인 프로그램
- * (project.sorting.2025.pptx)
  * "worker <master IP:port> -I <input directory> ... -O <output directory>"
  */
 object WorkerApp {
@@ -30,7 +29,7 @@ object WorkerApp {
     // 워커도 셔플 데이터를 받기 위한 포트가 필요합니다.
     // 여기서는 간단히 자신의 IP와 임의의 포트(예: 8081)를 사용합니다.
     val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
-    val selfPort = 8081 // TODO: 하드코딩된 포트 대신 사용 가능한 포트 찾기
+    val selfPort = 8080;
     val workerID = s"$selfIP:$selfPort"
 
     val workerNode = new WorkerNode(

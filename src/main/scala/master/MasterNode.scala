@@ -59,6 +59,7 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
           // 모든 워커가 등록되었는지 확인
           if (workerStatus.size == numWorkers && recoveryState == Sampling) {
             logger.info("All workers registered. Broadcasting Sampling phase.")
+            logger.info("workers IDs: " + allWorkerIDs.toString())
             // (이 RPC 응답이 가야 워커가 알 수 있으므로 별도 broadcast는 불필요)
           }
 
@@ -83,6 +84,50 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
           assignedState = assignedState.id,
           splitters = protoSplitters,
           allWorkerIds = workersToSend
+        )
+      )
+    }
+
+    override def heartbeat(req: HeartbeatRequest): Future[HeartbeatReply] = {
+      val workerID = req.workerId
+
+      val (currentState, splittersToSend, workersToSend) = synchronized {
+        // 1. 워커 상태 확인
+        val s = workerStatus.getOrElse(workerID, Failed)
+
+        // 2. 상태별 데이터 준비 여부 확인
+        if (s == Shuffling) {
+          // 셔플 단계지만 아직 스플리터가 계산 안 됐다면 'Waiting'으로 응답
+          if (globalSplitters == null) {
+            (Waiting, null, null)
+          } else {
+            (Shuffling, globalSplitters, allWorkerIDs)
+          }
+        } else if (s == Merging) {
+          // 병합 단계지만 다른 워커들이 셔플을 다 안 끝냈다면?
+          // (이 로직은 notifyShuffleComplete에서 처리하므로 보통은 바로 Merging 줘도 됨)
+          // 필요 시 여기서도 동기화 체크 가능
+          (Merging, null, null)
+        } else {
+          (s, null, null)
+        }
+      }
+
+      // Proto 변환
+      val protoSplitters = if (splittersToSend != null) {
+        splittersToSend.map(key => ProtoKey(key = ByteString.copyFrom(key)))
+      } else {
+        Seq.empty
+      }
+
+      val allIds = if (workersToSend != null) workersToSend else Seq.empty
+
+      // HeartbeatReply 생성 (Enum 변환 주의)
+      Future.successful(
+        HeartbeatReply(
+          state = HeartbeatReply.WorkerState.fromName(currentState.toString).getOrElse(HeartbeatReply.WorkerState.Unregistered),
+          splitters = protoSplitters,
+          allWorkerIds = allIds
         )
       )
     }
@@ -139,7 +184,7 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
         if (workerStatus.values.forall(_ == Done)) {
           logger.info("--- All workers done. Distributed sorting complete! ---")
           // (선택적) 마스터 서버 종료
-          // stop() 
+          // stop()
         }
       }
 

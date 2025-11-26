@@ -51,5 +51,5 @@ object WorkerState extends Enumeration {
    * Done: 모든 작업 완료
    * Failed: 작업 중 실패 (마스터가 감지)
    */
-  val Unregistered, Sampling, Shuffling, Merging, Done, Failed = Value
+  val Unregistered, Sampling, Shuffling, Merging, Done, Failed, Waiting = Value
 }
