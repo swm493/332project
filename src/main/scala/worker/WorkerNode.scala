@@ -5,7 +5,7 @@ import scala.collection.mutable.ListBuffer
 import java.io.{BufferedOutputStream, File, FileOutputStream}
 import services.WorkerState.*
 import services.{GrpcNetworkService, Key, NetworkService, StorageService, WorkerID, WorkerState}
-import services.CompareKey.compareKey
+import services.RecordOrdering.ordering.compare
 import services.Constant
 import sorting.sorting._
 
@@ -137,11 +137,11 @@ class WorkerNode(
     if (splitters == null || splitters.isEmpty) return 0
     var left = 0
     var right = splitters.length - 1
-    if (compareKey(key, splitters.head) <= 0) return 0
-    if (compareKey(key, splitters.last) > 0) return splitters.length
+    if (compare(key, splitters.head) <= 0) return 0
+    if (compare(key, splitters.last) > 0) return splitters.length
     while (left <= right) {
       val mid = (left + right) / 2
-      if (compareKey(key, splitters(mid)) <= 0) right = mid - 1
+      if (compare(key, splitters(mid)) <= 0) right = mid - 1
       else left = mid + 1
     }
     left
