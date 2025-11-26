@@ -197,7 +197,7 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
   }
 
   // (내부) 스플리터 계산 (MasterNode.scala - calculateSplitters)
-  private def calculateSplitters(): ListBuffer[Key] = {
+  private def calculateSplitters(): Unit = {
 
     val pivotN = (numWorkers * services.Constant.Size.partitionPerWorker) - 1
     val allSamples = workerSamples.values.flatten.toArray
@@ -209,7 +209,7 @@ class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: 
 
     for(i <- 1 to pivotN) splitters += allSamples(i * splitSize - 1)
 
-    splitters
+    globalSplitters = splitters.toList
   }
 
   // (내부) 워커 실패 감지 (MasterNode.scala - detectWorkerFailure)
