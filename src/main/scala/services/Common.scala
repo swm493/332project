@@ -10,6 +10,35 @@ type Key = Array[Byte]
 // 워커 ID (예: "192.168.0.1:8081")
 type WorkerID = String
 
+object Constant {
+  object Size {
+    def key: Int = 10
+    def value: Int = 90
+    def record: Int = 100
+  }
+  object Sample {
+    def n: Int = 1000
+  }
+}
+
+object RecordOrdering {
+  implicit val ordering: Ordering[Array[Byte]] = new Ordering[Array[Byte]] {
+    override def compare(x: Array[Byte], y: Array[Byte]): Int = {
+      var i = 0
+      while (i < Constant.Size.key) {
+        val a = x(i) & 0xFF
+        val b = y(i) & 0xFF
+
+        if (a != b) {
+          return a - b
+        }
+        i += 1
+      }
+      0
+    }
+  }
+}
+
 // MasterNode.scala 프로토타입을 기반으로 한 워커 상태
 object WorkerState extends Enumeration {
   type WorkerState = Value
