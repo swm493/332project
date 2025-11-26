@@ -5,7 +5,8 @@ import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import scala.util.{Try, Using}
 
-object StorageService {
+object StorageService {// 파일 쓰기 동기화를 위한 락 객체
+  private val writeLock = new Object()
   
   def extractSamples(file: File): List[Key] = {
     if(!file.exists() || file.length() == 0){
@@ -149,6 +150,44 @@ object StorageService {
     }
   }
 
+  /**
+   * [saveToTempFile]
+   * 수신된 데이터를 로컬 디렉토리의 파일에 추가(Append)합니다.
+   * gRPC의 여러 스레드가 동시에 접근하므로 동기화가 필수적입니다.
+   */
+  def saveToTempFile(outputDir: String, record: Array[Byte]): Unit = {
+    // 1. 출력 디렉토리 확인 및 생성
+    val dir = new File(outputDir)
+    if (!dir.exists()) {
+      dir.mkdirs()
+    }
+
+    // 2. 파일 지정 (모든 수신 데이터를 하나의 파일에 모읍니다)
+    // 성능을 위해 버퍼링을 사용하거나 여러 파일로 분산할 수도 있지만,
+    // 여기서는 안전성을 위해 단일 파일 Append 방식을 사용합니다.
+    val file = new File(dir, "shuffled_received.bin")
+
+    // 3. 동기화 블록 내에서 파일 쓰기 (Thread-Safe)
+    writeLock.synchronized {
+      // true = append mode
+      val fos = new FileOutputStream(file, true)
+      val bos = new BufferedOutputStream(fos)
+      try {
+        bos.write(record)
+        // 만약 레코드 구분이 필요하다면 개행이나 길이 정보를 추가해야 합니다.
+        // 예: 10바이트 고정 길이라면 그대로 쓰고, 가변 길이라면 길이를 먼저 써야 함.
+        // bos.write('\n') 
+      } catch {
+        case e: Exception =>
+          System.err.println(s"[StorageService] Write error: ${e.getMessage}")
+      } finally {
+        // 스트림 닫기
+        bos.close()
+        fos.close()
+      }
+    }
+  }
+  
   /**
    * [Utility] 임시 파일 삭제
    */

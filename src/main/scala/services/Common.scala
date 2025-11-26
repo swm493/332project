@@ -8,7 +8,7 @@ package services
 type Key = Array[Byte]
 
 // 워커 ID (예: "192.168.0.1:8081")
-type WorkerID = String
+type NodeIp = String
 
 object Constant {
   object Size {

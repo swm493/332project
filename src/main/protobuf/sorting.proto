@@ -1,6 +1,5 @@
 syntax = "proto3";
 
-// build.sbt의 ScalaPB 설정과 일치하는 패키지 경로
 package sorting;
 
 // Key를 bytes로 전송 (10 바이트)
@@ -9,16 +8,12 @@ message ProtoKey {
 }
 
 message RegisterRequest {
-  string workerId = 1; // "IP:Port"
+  string workerId = 1;
 }
 
 message RegisterReply {
-  // worker.scala 프로토타입 기반
-  // 마스터가 워커에게 할당하는 현재 작업 단계 (WorkerState enum에 매핑)
   int32 assignedState = 1;
-  // (재등록 시) 마스터가 이미 계산한 스플리터 목록
   repeated ProtoKey splitters = 2;
-  // (셔플 시) 다른 모든 워커들의 ID (주소) 목록
   repeated string allWorkerIds = 3;
 }
 
@@ -28,12 +23,12 @@ message SampleRequest {
 }
 
 message SampleReply {
-  bool ack = 1; // 수신 확인
+  bool ack = 1;
 }
 
 message NotifyRequest {
   string workerId = 1;
-  string message = 2; // (선택적) 로그용 메시지
+  string message = 2;
 }
 
 message NotifyReply {
@@ -59,23 +54,26 @@ message HeartbeatReply {
   repeated string all_worker_ids = 3;
 }
 
-/**
- * MasterNode가 구현할 Master-Worker 간 gRPC 서비스
- * (master.scala 프로토타입의 RPC 호출들을 기반으로 정의)
- */
+// [추가됨] 셔플 데이터 전송용 메시지
+message ShuffleRecord {
+  bytes data = 1; // 100 bytes record
+}
+
+message ShuffleReply {
+  bool success = 1;
+}
+
 service SortingService {
-  // 워커가 마스터에 등록 (master.scala, worker.scala)
   rpc RegisterWorker (RegisterRequest) returns (RegisterReply);
-
-  // 워커의 상태 수신
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
-
-  // 워커가 샘플 제출 (master.scala)
   rpc SubmitSamples (SampleRequest) returns (SampleReply);
-
-  // 워커가 셔플 완료 보고 (master.scala)
   rpc NotifyShuffleComplete (NotifyRequest) returns (NotifyReply);
-
-  // 워커가 병합 완료 보고 (master.scala)
   rpc NotifyMergeComplete (NotifyRequest) returns (NotifyReply);
+}
+
+// [추가됨] 워커 간 통신 서비스
+service WorkerService {
+  // Client-side Streaming: 클라이언트(송신 워커)는 여러 개의 레코드를 스트림으로 보내고,
+  // 서버(수신 워커)는 다 받으면 한 번의 Reply를 보냅니다.
+  rpc Shuffle (stream ShuffleRecord) returns (ShuffleReply);
 }
