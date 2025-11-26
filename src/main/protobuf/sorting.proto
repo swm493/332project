@@ -1,24 +1,20 @@
 syntax = "proto3";
 
-// build.sbt의 ScalaPB 설정과 일치하는 패키지 경로
 package sorting;
 
-// Key를 bytes로 전송 (10 바이트)
 message ProtoKey {
   bytes key = 1;
 }
 
 message RegisterRequest {
-  string workerId = 1; // "IP:Port"
+  string workerId = 1;
 }
 
 message RegisterReply {
-  // worker.scala 프로토타입 기반
-  // 마스터가 워커에게 할당하는 현재 작업 단계 (WorkerState enum에 매핑)
   int32 assignedState = 1;
-  // (재등록 시) 마스터가 이미 계산한 스플리터 목록
+  // 등록 시에는 편의상 바로 받아도 되지만, 일관성을 위해 제거하거나 유지할 수 있습니다.
+  // 여기서는 빠른 복구를 위해 유지하되, Heartbeat에서는 확실히 제거합니다.
   repeated ProtoKey splitters = 2;
-  // (셔플 시) 다른 모든 워커들의 ID (주소) 목록
   repeated string allWorkerIds = 3;
 }
 
@@ -28,12 +24,12 @@ message SampleRequest {
 }
 
 message SampleReply {
-  bool ack = 1; // 수신 확인
+  bool ack = 1;
 }
 
 message NotifyRequest {
   string workerId = 1;
-  string message = 2; // (선택적) 로그용 메시지
+  string message = 2;
 }
 
 message NotifyReply {
@@ -55,27 +51,27 @@ message HeartbeatReply {
     Waiting = 6;
   }
   WorkerState state = 1;
-  repeated ProtoKey splitters = 2;
-  repeated string all_worker_ids = 3;
+  // splitters와 all_worker_ids 제거됨 (GetGlobalState로 이동)
 }
 
-/**
- * MasterNode가 구현할 Master-Worker 간 gRPC 서비스
- * (master.scala 프로토타입의 RPC 호출들을 기반으로 정의)
- */
+// [신규] 전역 상태(스플리터, 워커 목록 등) 요청 메시지
+message GetGlobalStateRequest {
+  string workerId = 1;
+}
+
+// [신규] 전역 상태 응답 메시지
+message GetGlobalStateReply {
+  repeated ProtoKey splitters = 1;
+  repeated string allWorkerIds = 2;
+}
+
 service SortingService {
-  // 워커가 마스터에 등록 (master.scala, worker.scala)
   rpc RegisterWorker (RegisterRequest) returns (RegisterReply);
-
-  // 워커의 상태 수신
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
-
-  // 워커가 샘플 제출 (master.scala)
   rpc SubmitSamples (SampleRequest) returns (SampleReply);
-
-  // 워커가 셔플 완료 보고 (master.scala)
   rpc NotifyShuffleComplete (NotifyRequest) returns (NotifyReply);
-
-  // 워커가 병합 완료 보고 (master.scala)
   rpc NotifyMergeComplete (NotifyRequest) returns (NotifyReply);
+
+  // [신규] 무거운 데이터는 별도 요청으로 분리
+  rpc GetGlobalState (GetGlobalStateRequest) returns (GetGlobalStateReply);
 }

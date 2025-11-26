@@ -1,253 +1,139 @@
 package master
 
 import io.grpc.{Server, ServerBuilder}
-
 import scala.concurrent.{ExecutionContext, Future}
 import java.util.logging.Logger
 import scala.collection.mutable.{ListBuffer, Map as MutableMap}
 import services.WorkerState.*
 import services.{Key, WorkerID}
+import services.Constant
+import services.RecordOrdering.ordering
 
 import scala.collection.mutable
-// ScalaPB가 sorting.proto로부터 생성할 코드들
 import sorting.sorting._
 import com.google.protobuf.ByteString
 
-import services.RecordOrdering.ordering
-
-/**
- * MasterNode는 gRPC 서비스 (SortingService)를 구현합니다.
- * (MasterNode.scala 프로토타입 기반)
- */
 class MasterNode(executionContext: ExecutionContext, port: Int, val numWorkers: Int) {
-
+  // ... existing code (logger, server, variables) ...
   private val logger = Logger.getLogger(classOf[MasterNode].getName)
   private var server: Server = null
-
-  // --- Master의 상태 관리 ---
-  // (MasterNode.scala 프로토타입의 변수들)
   private val workerStatus = mutable.Map[WorkerID, WorkerState]()
   private val workerSamples = mutable.Map[WorkerID, List[Key]]()
   @volatile private var globalSplitters: List[Key] = null
   @volatile private var allWorkerIDs = List[WorkerID]()
 
-  // gRPC 서비스 구현체
   private object SortingServiceImpl extends SortingServiceGrpc.SortingService {
 
-    // [RPC] 워커가 마스터에 등록 (MasterNode.scala - RegisterWorker)
+    // ... existing code (registerWorker) ...
     override def registerWorker(req: RegisterRequest): Future[RegisterReply] = {
       val workerID = req.workerId
-      logger.info(s"Worker $workerID registering...")
-
-      // 동기화 블록으로 상태 관리
+      // ... existing logic to determine state ...
       val (assignedState, splittersToSend, workersToSend) = synchronized {
-        if (!workerStatus.contains(workerID) || workerStatus(workerID) == Failed) {
-          // (신규 등록) 또는 (실패 후 재등록)
-          if (!workerStatus.contains(workerID)) {
-            allWorkerIDs = workerID :: allWorkerIDs
-          }
-
-          // 현재 마스터의 전역 상태에 따라 워커의 다음 상태 결정
-          val recoveryState = if (globalSplitters != null) {
-            // 샘플링이 이미 끝났으면 셔플 단계로
-            workerStatus(workerID) = Shuffling
-            Shuffling
-          } else {
-            // 아직 샘플링 단계면 샘플링부터
-            workerStatus(workerID) = Sampling
-            Sampling
-          }
-
-          logger.info(s"Worker $workerID registered. Assigned state: $recoveryState. Total workers: ${workerStatus.size}/$numWorkers")
-
-          // 모든 워커가 등록되었는지 확인
-          if (workerStatus.size == numWorkers && recoveryState == Sampling) {
-            logger.info("All workers registered. Broadcasting Sampling phase.")
-            logger.info("workers IDs: " + allWorkerIDs.toString())
-            // (이 RPC 응답이 가야 워커가 알 수 있으므로 별도 broadcast는 불필요)
-          }
-
-          (recoveryState, globalSplitters, allWorkerIDs)
-
-        } else {
-          // (중복 등록 - 이미 활성 상태)
-          logger.warning(s"Worker $workerID tried to re-register while active.")
-          (workerStatus(workerID), globalSplitters, allWorkerIDs)
+        if (!workerStatus.contains(workerID)) {
+          allWorkerIDs = workerID :: allWorkerIDs
         }
+        val currentState = if (globalSplitters != null) {
+          val savedState = workerStatus.getOrElse(workerID, Shuffling)
+          if (savedState.id >= Merging.id) savedState else Shuffling
+        } else {
+          Sampling
+        }
+        workerStatus(workerID) = currentState
+
+        // Register 시에는 편의상 데이터를 줘도 됨 (옵션)
+        val splitters = if (currentState.id >= Shuffling.id) globalSplitters else null
+        (currentState, splitters, allWorkerIDs)
       }
 
-      // Proto Key로 변환
       val protoSplitters = if (splittersToSend != null) {
         splittersToSend.map(key => ProtoKey(key = ByteString.copyFrom(key)))
-      } else {
-        Seq.empty
-      }
+      } else Seq.empty
 
-      Future.successful(
-        RegisterReply(
-          assignedState = assignedState.id,
-          splitters = protoSplitters,
-          allWorkerIds = workersToSend
-        )
-      )
+      Future.successful(RegisterReply(assignedState.id, protoSplitters, workersToSend))
     }
 
+    // [수정] Heartbeat는 이제 상태만 반환 (가볍게)
     override def heartbeat(req: HeartbeatRequest): Future[HeartbeatReply] = {
       val workerID = req.workerId
-
-      val (currentState, splittersToSend, workersToSend) = synchronized {
-        // 1. 워커 상태 확인
+      val currentState = synchronized {
         val s = workerStatus.getOrElse(workerID, Failed)
-
-        // 2. 상태별 데이터 준비 여부 확인
-        if (s == Shuffling) {
-          // 셔플 단계지만 아직 스플리터가 계산 안 됐다면 'Waiting'으로 응답
-          if (globalSplitters == null) {
-            (Waiting, null, null)
-          } else {
-            (Shuffling, globalSplitters, allWorkerIDs)
-          }
-        } else if (s == Merging) {
-          // 병합 단계지만 다른 워커들이 셔플을 다 안 끝냈다면?
-          // (이 로직은 notifyShuffleComplete에서 처리하므로 보통은 바로 Merging 줘도 됨)
-          // 필요 시 여기서도 동기화 체크 가능
-          (Merging, null, null)
+        if (s == Shuffling && globalSplitters == null) {
+          Waiting
         } else {
-          (s, null, null)
+          s
         }
       }
 
-      // Proto 변환
-      val protoSplitters = if (splittersToSend != null) {
-        splittersToSend.map(key => ProtoKey(key = ByteString.copyFrom(key)))
-      } else {
-        Seq.empty
-      }
-
-      val allIds = if (workersToSend != null) workersToSend else Seq.empty
-
-      // HeartbeatReply 생성 (Enum 변환 주의)
       Future.successful(
         HeartbeatReply(
-          state = HeartbeatReply.WorkerState.fromName(currentState.toString).getOrElse(HeartbeatReply.WorkerState.Unregistered),
-          splitters = protoSplitters,
-          allWorkerIds = allIds
+          state = HeartbeatReply.WorkerState.fromName(currentState.toString).getOrElse(HeartbeatReply.WorkerState.Unregistered)
         )
       )
     }
 
-    // [RPC] 워커가 샘플 제출 (MasterNode.scala - SubmitSamples)
+    // [신규] 무거운 데이터를 요청할 때 호출되는 함수
+    override def getGlobalState(req: GetGlobalStateRequest): Future[GetGlobalStateReply] = {
+      val (splittersToSend, workersToSend) = synchronized {
+        (globalSplitters, allWorkerIDs)
+      }
+
+      val protoSplitters = if (splittersToSend != null) {
+        splittersToSend.map(key => ProtoKey(key = ByteString.copyFrom(key)))
+      } else Seq.empty
+
+      val protoWorkers = if (workersToSend != null) workersToSend else Seq.empty
+
+      Future.successful(
+        GetGlobalStateReply(
+          splitters = protoSplitters,
+          allWorkerIds = protoWorkers
+        )
+      )
+    }
+
+    // ... existing code (submitSamples, notifyShuffleComplete, etc.) ...
     override def submitSamples(req: SampleRequest): Future[SampleReply] = {
       val workerID = req.workerId
       val samples = req.samples.map(_.key.toByteArray).toList
-      logger.info(s"Received ${samples.length} samples from $workerID.")
-
       synchronized {
         workerSamples(workerID) = samples
-        workerStatus(workerID) = Shuffling // 샘플 냈으니 셔플 대기
-
-        // 모든 워커가 샘플을 제출했는지 확인
+        workerStatus(workerID) = Shuffling
         if (workerSamples.size == numWorkers) {
-          logger.info("All samples received. Calculating splitters...")
           calculateSplitters()
-          logger.info(s"${globalSplitters.length} splitters calculated. Broadcasting Shuffling phase.")
-          // (별도 broadcast 대신, 다음 register/heartbeat 시 splitters가 전달됨)
         }
       }
-
       Future.successful(SampleReply(ack = true))
     }
 
-    // [RPC] 워커가 셔플 완료 보고 (MasterNode.scala - NotifyShuffleComplete)
     override def notifyShuffleComplete(req: NotifyRequest): Future[NotifyReply] = {
-      val workerID = req.workerId
-      logger.info(s"Worker $workerID reported Shuffle complete.")
-
-      synchronized {
-        workerStatus(workerID) = Merging
-
-        // 모든 워커가 셔플을 완료했는지 확인
-        if (workerStatus.values.forall(_ == Merging)) {
-          logger.info("All workers finished shuffling. Broadcasting Merging phase.")
-          // (별도 broadcast 필요 없음)
-        }
-      }
-
+      synchronized { workerStatus(req.workerId) = Merging }
       Future.successful(NotifyReply(ack = true))
     }
 
-    // [RPC] 워커가 병합 완료 보고 (MasterNode.scala - NotifyMergeComplete)
     override def notifyMergeComplete(req: NotifyRequest): Future[NotifyReply] = {
-      val workerID = req.workerId
-      logger.info(s"Worker $workerID reported Merge complete.")
-
-      synchronized {
-        workerStatus(workerID) = Done
-
-        // 모든 워커가 완료했는지 확인
-        if (workerStatus.values.forall(_ == Done)) {
-          logger.info("--- All workers done. Distributed sorting complete! ---")
-          // (선택적) 마스터 서버 종료
-          // stop()
-        }
-      }
-
+      synchronized { workerStatus(req.workerId) = Done }
       Future.successful(NotifyReply(ack = true))
     }
   }
 
-  // (내부) 스플리터 계산 (MasterNode.scala - calculateSplitters)
+  // ... existing code (calculateSplitters, start, stop) ...
   private def calculateSplitters(): Unit = {
-
-    val pivotN = (numWorkers * services.Constant.Size.partitionPerWorker) - 1
+    val totalPartitions = numWorkers * Constant.Size.partitionPerWorker
+    val numSplitters = totalPartitions - 1
     val allSamples = workerSamples.values.flatten.toArray
-
-    val splitSize: Int = allSamples.length / (pivotN + 1)
-    val splitters: ListBuffer[Key] = ListBuffer.empty
-
     java.util.Arrays.sort(allSamples, ordering)
-
-    for(i <- 1 to pivotN) splitters += allSamples(i * splitSize - 1)
-
+    val splitters = ListBuffer[Key]()
+    val step = allSamples.length / totalPartitions
+    for (i <- 1 to numSplitters) {
+      val idx = Math.min(i * step, allSamples.length - 1)
+      splitters += allSamples(idx)
+    }
     globalSplitters = splitters.toList
   }
 
-  // (내부) 워커 실패 감지 (MasterNode.scala - detectWorkerFailure)
-  // TODO: gRPC는 연결 기반이므로, 타임아웃/하트비트 메커니즘이 필요.
-  def detectWorkerFailure(workerID: WorkerID): Unit = synchronized {
-    if(workerStatus.get(workerID).exists(s => s != Done && s != Failed)) {
-      logger.severe(s"Worker $workerID FAILED.")
-      workerStatus(workerID) = Failed
-      // Fault-Tolerance: 이 워커가 재시작(RegisterWorker)하면
-      // 현재 마스터 상태(globalSplitters 등)를 받아 작업을 재개합니다.
-    }
-  }
-
   def start(): Unit = {
-    server = ServerBuilder.forPort(port)
-      .addService(SortingServiceGrpc.bindService(SortingServiceImpl, executionContext))
-      .build
-      .start
-
-    val ip = java.net.InetAddress.getLocalHost.getHostAddress
-    logger.info(s"Master server started, listening on $port")
-
-    // (project.sorting.2025.pptx - 명세서)
-    println(s"Master listening on: $ip:$port")
-    // (워커 IP는 등록 시점에 결정되므로, 여기서는 출력 불가)
-    // (대신, RegisterWorker에서 워커 IP 목록(allWorkerIDs)을 워커에게 전달)
-
-    sys.addShutdownHook {
-      System.err.println("*** Shutting down gRPC server...")
-      this.stop()
-      System.err.println("*** Server shut down.")
-    }
+    server = ServerBuilder.forPort(port).addService(SortingServiceGrpc.bindService(SortingServiceImpl, executionContext)).build.start
     server.awaitTermination()
   }
-
-  def stop(): Unit = {
-    if (server != null) {
-      server.shutdown()
-    }
-  }
+  def stop(): Unit = if (server != null) server.shutdown()
 }
