@@ -70,19 +70,19 @@ object WorkerApp {
 
       if (inputDirs.isEmpty) return None
 
-      // (project.sorting.2025.pptx) 디렉토리 유효성 검사
-      inputDirs.foreach(dir =>
-        if (!new File(dir).isDirectory) {
-          System.err.println(s"Input directory not found: $dir")
-          return None
-        }
-      )
-      if (!new File(outputDir).isDirectory) {
-        System.err.println(s"Output directory not found: $outputDir")
-        return None
-      }
+      inputDirs.find(dir => !new File(dir).isDirectory) match {
+        case Some(invalidDir) =>
+          System.err.println(s"Input directory not found: $invalidDir")
+          None
 
-      Some(Config(masterAddress, inputDirs.toList, outputDir))
+        case None =>
+          if (!new File(outputDir).isDirectory) {
+            System.err.println(s"Output directory not found: $outputDir")
+            None
+          } else {
+            Some(Config(masterAddress, inputDirs.toList, outputDir))
+          }
+      }
 
     } catch {
       case _: Exception => None
