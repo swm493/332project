@@ -15,7 +15,7 @@ import services.NodeID
  * * @param selfID         자신의 IP:Port (서버 포트 결정용)
  * @param onDataReceived 외부(WorkerState 등)로 데이터를 전달할 콜백 함수
  */
-class WorkerNetworkService(selfID: NodeID, onDataReceived: Array[Byte] => Unit)(implicit ec: ExecutionContext)
+class WorkerNetworkService(selfID: NodeID, onDataReceived: (Int, Array[Byte]) => Unit)(implicit ec: ExecutionContext)
   extends WorkerServiceGrpc.WorkerService {
 
   private val logger = Logger.getLogger(classOf[WorkerNetworkService].getName)
@@ -47,7 +47,7 @@ class WorkerNetworkService(selfID: NodeID, onDataReceived: Array[Byte] => Unit)(
     new StreamObserver[ShuffleRecord] {
       override def onNext(req: ShuffleRecord): Unit = {
         // 수신된 데이터를 콜백을 통해 로직(WorkerState)으로 전달
-        onDataReceived(req.data.toByteArray)
+        onDataReceived(req.partitionID, req.data.toByteArray)
       }
 
       override def onError(t: Throwable): Unit = {
@@ -66,53 +66,44 @@ class WorkerNetworkService(selfID: NodeID, onDataReceived: Array[Byte] => Unit)(
   // (기존 로직 유지: 다른 Worker에게 데이터를 보낼 때 사용)
 
   private val channels = new ConcurrentHashMap[NodeID, ManagedChannel]()
-  private val observers = new ConcurrentHashMap[NodeID, StreamObserver[ShuffleRecord]]()
+  private val sendObservers = new ConcurrentHashMap[NodeID, StreamObserver[ShuffleRecord]]()
 
-  def sendRecord(targetWorkerID: NodeID, record: Array[Byte]): Unit = {
-    // 1. 채널 생성 (Lazy init)
+  // [수정] 파티션 ID를 인자로 추가
+  def sendData(targetWorkerID: NodeID, partitionID: Int, data: Array[Byte]): Unit = {
     channels.computeIfAbsent(targetWorkerID, id => {
       val Array(host, p) = id.split(":")
       ManagedChannelBuilder.forAddress(host, p.toInt).usePlaintext().build()
     })
 
-    // 2. 스트림 생성 (Lazy init)
-    observers.computeIfAbsent(targetWorkerID, id => {
+    val observer = sendObservers.computeIfAbsent(targetWorkerID, id => {
       val stub = WorkerServiceGrpc.stub(channels.get(id))
       stub.shuffle(new StreamObserver[ShuffleReply] {
-        override def onNext(value: ShuffleReply): Unit = {} // Ack 처리
-        override def onError(t: Throwable): Unit = logger.warning(s"Send error to $id: ${t.getMessage}")
+        override def onNext(value: ShuffleReply): Unit = {}
+        override def onError(t: Throwable): Unit = {
+          logger.warning(s"Send error to $id: ${t.getMessage}")
+          sendObservers.remove(id)
+        }
         override def onCompleted(): Unit = {}
       })
     })
 
-    // 3. 데이터 전송
-    val observer = observers.get(targetWorkerID)
-    // StreamObserver는 Thread-safe하지 않을 수 있으므로 동기화 처리
+    // [수정] 파티션 ID를 포함해서 전송
     observer.synchronized {
-      observer.onNext(ShuffleRecord(ByteString.copyFrom(record)))
+      observer.onNext(ShuffleRecord(data = ByteString.copyFrom(data), partitionID = partitionID))
     }
   }
 
   def finishSending(): Unit = {
-    val it = observers.values().iterator()
-    while (it.hasNext) {
-      it.next().onCompleted()
-    }
+    val it = sendObservers.values().iterator()
+    while (it.hasNext) it.next().onCompleted()
+    sendObservers.clear()
   }
 
   def shutdown(): Unit = {
-    // 클라이언트 리소스 정리
+    finishSending()
     val it = channels.values().iterator()
-    while (it.hasNext) {
-      val channel = it.next()
-      channel.shutdown().awaitTermination(1, TimeUnit.SECONDS)
-    }
+    while (it.hasNext) it.next().shutdown().awaitTermination(1, TimeUnit.SECONDS)
     channels.clear()
-    observers.clear()
-
-    // 서버 종료
-    if (server != null) {
-      server.shutdown().awaitTermination(1, TimeUnit.SECONDS)
-    }
+    if (server != null) server.shutdown().awaitTermination(1, TimeUnit.SECONDS)
   }
 }

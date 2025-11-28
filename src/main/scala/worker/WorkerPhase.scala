@@ -1,17 +1,20 @@
 package worker
 
 import scala.concurrent.ExecutionContext.Implicits.global
-import services.{StorageService, Constant}
-import services.WorkerState._
-import sorting.master.{SampleRequest, NotifyRequest}
+import services.{Constant, StorageService}
+import services.WorkerState.*
+import sorting.master.{NotifyRequest, SampleRequest}
 import sorting.common.ProtoKey
 import com.google.protobuf.ByteString
-import java.io.{BufferedOutputStream, File, FileOutputStream}
-import scala.collection.mutable.ListBuffer
+
+import java.io._
+import scala.collection.mutable.{ListBuffer, Map as MutableMap}
 
 trait WorkerPhase {
   def execute(ctx: WorkerContext): WorkerState
 }
+
+case class PartitionSegment(partitionId: Int, offset: Long, length: Int)
 
 class SamplingPhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
@@ -35,85 +38,214 @@ class ShufflePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     println("[Phase] Shuffling Started")
 
-    // 1. 로컬 저장소 및 네트워크 초기화
     val P = Constant.Size.partitionPerWorker
     val totalPartitions = ctx.allWorkerIDs.length * P
+    val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
+    val myStartIdx = myWorkerIdx * P
+    val myEndIdx = myStartIdx + P
 
-    // 내 로컬 파티션 파일들 준비 (다른 워커로 안 보내고 내가 가질 것들)
-    val localFiles = Array.ofDim[File](totalPartitions) // 실제로는 내가 맡은 범위만 써도 되지만 인덱싱 편의상
-    val localStreams = Array.ofDim[BufferedOutputStream](totalPartitions)
+    // --- 1. 수신부 준비 (최적화됨) ---
+    val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
+    val outputFiles = new ListBuffer[File]()
 
-    // 내가 받아야 할 임시 파일
-    val recvFile = new File(ctx.outputDir, s"worker_${ctx.workerWorkerID}_recv_temp")
-    val recvBos = new BufferedOutputStream(new FileOutputStream(recvFile))
+    for (i <- myStartIdx until myEndIdx) {
+      val f = new File(ctx.outputDir, s"partition_received_$i")
+      outputFiles += f
+      partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(f, true))
+    }
 
-    // 1. 생성자에 콜백 함수를 직접 전달합니다.
+    // [수정된 콜백] pIdx를 바로 받아서 파일에 씀
     ctx.networkService = new WorkerNetworkService(
       ctx.workerWorkerID,
-      { record =>
-        recvBos.synchronized {
-          recvBos.write(record)
+      { (pIdx, data) =>
+        // 계산 없이 바로 검증 후 쓰기
+        if (pIdx >= myStartIdx && pIdx < myEndIdx) {
+          val stream = partitionStreams(pIdx)
+          stream.synchronized {
+            stream.write(data)
+          }
         }
       }
     )
-
-    // 2. 서버 시작은 인자 없이 호출합니다. (메서드 이름도 startServer로 변경됨)
     ctx.networkService.startServer()
 
     try {
-      // 2. 파티셔닝 및 전송 (develop 로직 통합)
-      println("Start Partitioning and Sending...")
+      val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
+      if (!tempChunkDir.exists()) tempChunkDir.mkdirs()
+      val generatedChunks = new ListBuffer[(File, File)]()
 
-      // 로컬 파일 스트림은 필요할 때 열거나, 미리 열어둠 (여기선 간략화)
-      // 로직 최적화를 위해 내 파티션 인덱스 범위 계산
-      val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
-      val myStartIdx = myWorkerIdx * P
-      val myEndIdx = myStartIdx + P
+      // --- [Step A] Local Sort & Indexing (가상 파티셔닝) ---
+      println("Step A: Local Sort & Indexing...")
+      var chunkId = 0
+      for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
+        val recordsIter = StorageService.readRecords(file)
+        if (recordsIter.hasNext) {
+          val blockData = recordsIter.toArray
+          scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
+          val segments = findPartitionSegments(blockData, ctx, totalPartitions) // Helper 메서드
 
-      // 로컬 파일 준비
-      for (i <- myStartIdx until myEndIdx) {
-        localFiles(i) = new File(ctx.outputDir, s"partition_local_$i")
-        localStreams(i) = new BufferedOutputStream(new FileOutputStream(localFiles(i)))
+          val dataFile = new File(tempChunkDir, s"chunk_$chunkId.data")
+          val indexFile = new File(tempChunkDir, s"chunk_$chunkId.index")
+
+          saveSortedBlock(blockData, dataFile) // Helper 메서드
+          saveIndex(segments, indexFile) // Helper 메서드
+
+          generatedChunks += ((dataFile, indexFile))
+          chunkId += 1
+        }
       }
 
-      for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
-        val records = StorageService.readRecords(file)
-        while(records.hasNext) {
-          val record = records.next()
-          // Context의 유틸리티 사용
-          val pIdx = ctx.findPartitionIndex(record.take(Constant.Size.key))
+      // --- [Step B] Batch Sending (인덱스 기반 전송) ---
+      println("Step B: Batch Sending...")
 
-          if (pIdx >= 0 && pIdx < totalPartitions) {
-            val targetWorkerID = ctx.allWorkerIDs(pIdx / P)
+      // 버퍼링: (TargetWorkerID, PartitionID) -> Buffer
+      val BATCH_SIZE = 1024 * 1024
+      val networkBuffers = MutableMap[(String, Int), ByteArrayOutputStream]()
 
-            if (targetWorkerID == ctx.workerWorkerID) {
-              // 내 담당 파티션이면 로컬 파일에 바로 씀
-              localStreams(pIdx).write(record)
-            } else {
-              // 다른 워커면 네트워크 전송
-              ctx.networkService.sendRecord(targetWorkerID, record)
-            }
+      def flushBuffer(key: (String, Int)): Unit = {
+        val (targetID, pId) = key
+        if (networkBuffers.contains(key)) {
+          val buf = networkBuffers(key)
+          if (buf.size() > 0) {
+            // [수정] 파티션 ID를 같이 보냄
+            ctx.networkService.sendData(targetID, pId, buf.toByteArray)
+            buf.reset()
           }
         }
       }
 
-      // 3. 정리 및 완료 신호
-      for (i <- myStartIdx until myEndIdx) if (localStreams(i) != null) localStreams(i).close()
+      for ((dataFile, indexFile) <- generatedChunks) {
+        val segments = loadIndex(indexFile) // Helper 메서드
+        val raf = new RandomAccessFile(dataFile, "r")
+        try {
+          for (seg <- segments) {
+            val targetWorkerIdx = seg.partitionId / P
+            if (targetWorkerIdx < ctx.allWorkerIDs.length) {
+              val targetWorkerID = ctx.allWorkerIDs(targetWorkerIdx)
+              val chunkBytes = new Array[Byte](seg.length)
+              raf.seek(seg.offset)
+              raf.readFully(chunkBytes)
+
+              if (targetWorkerID == ctx.workerWorkerID) {
+                // 내 거면 바로 씀
+                partitionStreams(seg.partitionId).write(chunkBytes)
+              } else {
+                // 남의 거면 (타겟, 파티션ID)별로 버퍼링
+                val bufferKey = (targetWorkerID, seg.partitionId)
+                val buf = networkBuffers.getOrElseUpdate(bufferKey, new ByteArrayOutputStream(BATCH_SIZE * 2))
+                buf.write(chunkBytes)
+                if (buf.size() >= BATCH_SIZE) flushBuffer(bufferKey)
+              }
+            }
+          }
+        } finally {
+          raf.close()
+        }
+      }
+
+      networkBuffers.keys.foreach(flushBuffer)
       ctx.networkService.finishSending()
 
-      // 중요: 수신 완료 대기 로직 필요 (여기선 단순화하여 Master에 완료 보고 후 상태 대기)
-      // 실제로는 네트워크 서비스에서 모든 Peer의 연결 종료를 감지하거나 별도 시그널 필요
-      // develop 코드에 따라 단순히 sleep 하거나 종료
-      Thread.sleep(3000)
+      // --- [Step C] Cleanup & Wait ---
+      println("Waiting for reception...")
+      Thread.sleep(5000)
 
-      recvBos.close()
+      generatedChunks.foreach { case (d, i) => d.delete(); i.delete() }
+      tempChunkDir.delete()
+
     } finally {
+      for (s <- partitionStreams) if (s != null) {
+        s.flush(); s.close()
+      }
       ctx.networkService.shutdown()
     }
 
     ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.masterWorkerID))
     println("[Phase] Shuffling Done.")
     Merging
+  }
+
+  // --- Helper Methods ---
+
+  /**
+   * 정렬된 블록 데이터에서 파티션 경계(Segment)를 찾습니다.
+   * 단순히 순회하면서 파티션 ID가 바뀌는 지점을 기록합니다. (이분 탐색보다 순회가 더 빠를 수 있음)
+   */
+  private def findPartitionSegments(
+                                     sortedData: Array[Array[Byte]],
+                                     ctx: WorkerContext,
+                                     totalPartitions: Int
+                                   ): List[PartitionSegment] = {
+    val segments = new ListBuffer[PartitionSegment]()
+
+    if (sortedData.isEmpty) return segments.toList
+
+    var currentPIdx = ctx.findPartitionIndex(sortedData(0).take(Constant.Size.key))
+    var startOffset = 0L
+    var count = 0
+    val recordSize = Constant.Size.record
+
+    for (i <- sortedData.indices) {
+      val key = sortedData(i).take(Constant.Size.key)
+      val pIdx = ctx.findPartitionIndex(key)
+
+      if (pIdx != currentPIdx) {
+        // 파티션이 바뀌었으므로 이전 구간 기록
+        segments += PartitionSegment(currentPIdx, startOffset, count * recordSize)
+
+        // 새 구간 시작
+        currentPIdx = pIdx
+        startOffset = i * recordSize
+        count = 0
+      }
+      count += 1
+    }
+    // 마지막 구간 기록
+    segments += PartitionSegment(currentPIdx, startOffset, count * recordSize)
+
+    segments.toList
+  }
+
+  private def saveSortedBlock(data: Array[Array[Byte]], file: File): Unit = {
+    val bos = new BufferedOutputStream(new FileOutputStream(file))
+    try {
+      data.foreach(bos.write)
+    } finally {
+      bos.close()
+    }
+  }
+
+  private def saveIndex(segments: List[PartitionSegment], file: File): Unit = {
+    val dos = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)))
+    try {
+      dos.writeInt(segments.size)
+      segments.foreach { seg =>
+        dos.writeInt(seg.partitionId)
+        dos.writeLong(seg.offset)
+        dos.writeInt(seg.length)
+      }
+    } finally {
+      dos.close()
+    }
+  }
+
+  private def loadIndex(file: File): List[PartitionSegment] = {
+    val dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))
+    val segments = new ListBuffer[PartitionSegment]()
+    try {
+      val count = dis.readInt()
+      for (_ <- 0 until count) {
+        val pId = dis.readInt()
+        val off = dis.readLong()
+        val len = dis.readInt()
+        segments += PartitionSegment(pId, off, len)
+      }
+    } catch {
+      case _: EOFException => // End of file
+    } finally {
+      dis.close()
+    }
+    segments.toList
   }
 }
 
