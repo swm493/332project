@@ -47,15 +47,20 @@ class ShufflePhase extends WorkerPhase {
 
     // --- 1. 수신부 준비 ---
     val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
+    val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
     val outputFiles = new ListBuffer[File]()
 
     println(s"Initializing partition files ($myStartIdx ~ ${myEndIdx - 1})...")
     for (i <- myStartIdx until myEndIdx) {
-      val f = new File(ctx.outputDir, s"partition_received_$i")
-      if (f.exists()) f.delete() // 중복 방지 초기화
+      val fData = new File(ctx.outputDir, s"partition_received_$i")
+      val fIndex = new File(ctx.outputDir, s"partition_received_$i.index")
+      if (fData.exists()) fData.delete()
+      if (fIndex.exists()) fIndex.delete()
 
-      outputFiles += f
-      partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(f, true))
+      outputFiles += fData
+      outputFiles += fIndex
+      partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(fData, true))
+      partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
     }
 
     // 서버 시작 (shutdown은 여기서 하지 않음!)
@@ -64,8 +69,10 @@ class ShufflePhase extends WorkerPhase {
       { (pIdx, data) =>
         if (pIdx >= myStartIdx && pIdx < myEndIdx) {
           val stream = partitionStreams(pIdx)
+          val idxStream = partitionIndexStreams(pIdx)
           stream.synchronized {
             stream.write(data)
+            idxStream.writeInt(data.length)
           }
         }
       }
@@ -139,8 +146,13 @@ class ShufflePhase extends WorkerPhase {
               raf.readFully(chunkBytes)
 
               if (targetWorkerID == ctx.workerWorkerID) {
-                // 내 데이터도 로컬 파일에 안전하게 씀 (Merge때 사용)
-                partitionStreams(seg.partitionId).write(chunkBytes)
+                // 내 데이터 -> 바로 로컬 파일에 (인덱스 포함)
+                val stream = partitionStreams(seg.partitionId)
+                val idxStream = partitionIndexStreams(seg.partitionId)
+                stream.synchronized {
+                  stream.write(chunkBytes)
+                  idxStream.writeInt(chunkBytes.length)
+                }
               } else {
                 val bufferKey = (targetWorkerID, seg.partitionId)
                 val buf = networkBuffers.getOrElseUpdate(bufferKey, new ByteArrayOutputStream(BATCH_SIZE * 2))
@@ -159,21 +171,37 @@ class ShufflePhase extends WorkerPhase {
       // 클라이언트(보내는 기능)만 종료. 서버(받는 기능)는 살려둠!
       ctx.networkService.finishSending()
 
-      println("Shuffle Phase Logic Complete. Waiting for global sync...")
+      println("Sending complete. Deleting temporary chunks...")
 
-      // [수정] 파일 삭제 코드 제거함 (Merge 단계나 디버깅을 위해 유지)
-      // generatedChunks.foreach(...) -> 삭제 안 함
-
-    } finally {
-      // 파일 스트림은 안전하게 닫아줘야 데이터가 저장됨
-      for (s <- partitionStreams) if (s != null) {
-        s.flush(); s.close()
+      generatedChunks.foreach { case (dataFile, indexFile) =>
+        if (dataFile.exists()) dataFile.delete()
+        if (indexFile.exists()) indexFile.delete()
       }
 
+      if (tempChunkDir.exists()) tempChunkDir.delete()
+
+      println("Notifying Master and waiting for Global Sync...")
+
+      ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.masterWorkerID))
+
+      var globalDone = false
+      while (!globalDone) {
+        val hb = ctx.masterClient.heartbeat(sorting.master.HeartbeatRequest(ctx.masterWorkerID))
+        if (hb.state == sorting.master.HeartbeatReply.WorkerState.Merging) {
+          globalDone = true
+        } else {
+          Thread.sleep(100)
+        }
+      }
+      println("Global Shuffle Complete! Proceeding to cleanup.")
+
+    } finally {
+      if (ctx.networkService != null) ctx.networkService.shutdown()
+
+      for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
+      for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
     }
 
-    ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.masterWorkerID))
-    println("[Phase] Shuffling Done.")
     Merging
   }
 
@@ -245,18 +273,90 @@ class ShufflePhase extends WorkerPhase {
 class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     println("[Phase] Merging Started")
+    
+    val P = Constant.Size.partitionPerWorker
+    val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
+    val myStartIdx = myWorkerIdx * P
+    val myEndIdx = myStartIdx + P
 
-    // [핵심] 이제 더 이상 받을 데이터가 없으므로 네트워크 서비스를 종료합니다.
-    if (ctx.networkService != null) {
-      println("Shutting down Worker Network Service...")
-      ctx.networkService.shutdown()
+    // 각 파티션별로 병합 수행
+    for (pId <- myStartIdx until myEndIdx) {
+      val dataFile = new File(ctx.outputDir, s"partition_received_$pId.data")
+      val indexFile = new File(ctx.outputDir, s"partition_received_$pId.index")
+      val finalFile = new File(ctx.outputDir, s"partition.$pId")
+
+      if (dataFile.exists() && indexFile.exists()) {
+        println(s"Merging partition $pId...")
+
+        // 1. 인덱스 로드 (각 청크의 길이 정보)
+        val chunkLengths = loadChunkLengths(indexFile)
+
+        // 2. 데이터 파일을 쪼개서 Iterator들 생성
+        // (주의: RAF는 메모리를 많이 쓰지 않지만, Iterator 개수가 많으면 파일 핸들 문제 주의)
+        // 여기서는 간단히 메모리 로드 방식이나 OnDemandChunkIterator 사용
+        val raf = new RandomAccessFile(dataFile, "r")
+        val iterators = createChunkIterators(raf, chunkLengths)
+
+        // 3. K-way Merge 실행
+        val bos = new BufferedOutputStream(new FileOutputStream(finalFile))
+        try {
+          services.MergeService.merge(
+            iterators,
+            record => bos.write(record)
+          )
+        } finally {
+          bos.close()
+          raf.close()
+        }
+      } else {
+        // 데이터 없는 파티션 처리 (빈 파일 생성)
+        new FileOutputStream(finalFile).close()
+      }
     }
-
-    // Merge 로직 수행 (기존 로직 유지)
-    // ...
 
     ctx.masterClient.notifyMergeComplete(NotifyRequest(ctx.masterWorkerID))
     println("[Phase] Merging Done.")
     Done
+  }
+
+  // --- Helpers ---
+  private def loadChunkLengths(file: File): List[Int] = {
+    val dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))
+    val lengths = new ListBuffer[Int]()
+    try {
+      while (dis.available() > 0) lengths += dis.readInt()
+    } catch { case _: EOFException => } finally { dis.close() }
+    lengths.toList
+  }
+
+  // Helper: RAF를 공유하는 커스텀 Iterator 생성
+  private def createChunkIterators(raf: RandomAccessFile, lengths: List[Int]): Seq[Iterator[Array[Byte]]] = {
+    var currentOffset = 0L
+    val iterators = new ListBuffer[Iterator[Array[Byte]]]()
+    for (len <- lengths) {
+      iterators += new OnDemandChunkIterator(raf, currentOffset, len)
+      currentOffset += len
+    }
+    iterators.toSeq
+  }
+}
+
+// [Custom Iterator] 파일의 특정 구간만 읽어오는 이터레이터
+class OnDemandChunkIterator(raf: RandomAccessFile, startOffset: Long, length: Int) extends Iterator[Array[Byte]] {
+  private var readBytes = 0
+  private val recordSize = Constant.Size.record
+
+  override def hasNext: Boolean = readBytes < length
+
+  override def next(): Array[Byte] = {
+    if (!hasNext) throw new NoSuchElementException
+    val buffer = new Array[Byte](recordSize)
+
+    raf.synchronized {
+      raf.seek(startOffset + readBytes)
+      raf.readFully(buffer)
+    }
+    readBytes += recordSize
+    buffer
   }
 }
