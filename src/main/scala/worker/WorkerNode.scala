@@ -18,8 +18,8 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
 
-  private val MasterWorkerID = s"${selfIP}${Ports.MasterWorkerPort}"
-  private val WorkerWorkerID = s"${selfIP}${Ports.WorkerWorkerPort}"
+  private val MasterWorkerID = s"${selfIP}:${Ports.MasterWorkerPort}"
+  private val WorkerWorkerID = s"${selfIP}:${Ports.WorkerWorkerPort}"
 
   // 1. Master 연결 설정
   private val Array(host, port) = masterAddress.split(":")
