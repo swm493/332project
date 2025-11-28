@@ -40,25 +40,28 @@ class ShufflePhase extends WorkerPhase {
 
     val P = Constant.Size.partitionPerWorker
     val totalPartitions = ctx.allWorkerIDs.length * P
+
     val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
     val myStartIdx = myWorkerIdx * P
     val myEndIdx = myStartIdx + P
 
-    // --- 1. 수신부 준비 (최적화됨) ---
+    // --- 1. 수신부 준비 ---
     val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
     val outputFiles = new ListBuffer[File]()
 
+    println(s"Initializing partition files ($myStartIdx ~ ${myEndIdx - 1})...")
     for (i <- myStartIdx until myEndIdx) {
       val f = new File(ctx.outputDir, s"partition_received_$i")
+      if (f.exists()) f.delete() // 중복 방지 초기화
+
       outputFiles += f
       partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(f, true))
     }
 
-    // [수정된 콜백] pIdx를 바로 받아서 파일에 씀
+    // 서버 시작 (shutdown은 여기서 하지 않음!)
     ctx.networkService = new WorkerNetworkService(
       ctx.workerWorkerID,
       { (pIdx, data) =>
-        // 계산 없이 바로 검증 후 쓰기
         if (pIdx >= myStartIdx && pIdx < myEndIdx) {
           val stream = partitionStreams(pIdx)
           stream.synchronized {
@@ -69,12 +72,24 @@ class ShufflePhase extends WorkerPhase {
     )
     ctx.networkService.startServer()
 
+    println("Server started. Waiting for Barrier synchronization...")
+    try {
+      ctx.masterClient.checkShuffleReady(
+        sorting.master.ShuffleReadyRequest(workerId = ctx.masterWorkerID)
+      )
+      println("Barrier Passed! All workers represent ready. Starting Batch Sending...")
+    } catch {
+      case e: Exception =>
+        println(s"Barrier failed: ${e.getMessage}")
+      // 실패 시 처리가 필요하지만, 일단 진행하거나 재시도 로직 필요
+    }
+
     try {
       val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
       if (!tempChunkDir.exists()) tempChunkDir.mkdirs()
       val generatedChunks = new ListBuffer[(File, File)]()
 
-      // --- [Step A] Local Sort & Indexing (가상 파티셔닝) ---
+      // --- [Step A] Local Sort & Indexing ---
       println("Step A: Local Sort & Indexing...")
       var chunkId = 0
       for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
@@ -82,23 +97,21 @@ class ShufflePhase extends WorkerPhase {
         if (recordsIter.hasNext) {
           val blockData = recordsIter.toArray
           scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
-          val segments = findPartitionSegments(blockData, ctx, totalPartitions) // Helper 메서드
+          val segments = findPartitionSegments(blockData, ctx)
 
           val dataFile = new File(tempChunkDir, s"chunk_$chunkId.data")
           val indexFile = new File(tempChunkDir, s"chunk_$chunkId.index")
 
-          saveSortedBlock(blockData, dataFile) // Helper 메서드
-          saveIndex(segments, indexFile) // Helper 메서드
+          saveSortedBlock(blockData, dataFile)
+          saveIndex(segments, indexFile)
 
           generatedChunks += ((dataFile, indexFile))
           chunkId += 1
         }
       }
 
-      // --- [Step B] Batch Sending (인덱스 기반 전송) ---
+      // --- [Step B] Batch Sending ---
       println("Step B: Batch Sending...")
-
-      // 버퍼링: (TargetWorkerID, PartitionID) -> Buffer
       val BATCH_SIZE = 1024 * 1024
       val networkBuffers = MutableMap[(String, Int), ByteArrayOutputStream]()
 
@@ -107,7 +120,6 @@ class ShufflePhase extends WorkerPhase {
         if (networkBuffers.contains(key)) {
           val buf = networkBuffers(key)
           if (buf.size() > 0) {
-            // [수정] 파티션 ID를 같이 보냄
             ctx.networkService.sendData(targetID, pId, buf.toByteArray)
             buf.reset()
           }
@@ -115,7 +127,7 @@ class ShufflePhase extends WorkerPhase {
       }
 
       for ((dataFile, indexFile) <- generatedChunks) {
-        val segments = loadIndex(indexFile) // Helper 메서드
+        val segments = loadIndex(indexFile)
         val raf = new RandomAccessFile(dataFile, "r")
         try {
           for (seg <- segments) {
@@ -127,10 +139,9 @@ class ShufflePhase extends WorkerPhase {
               raf.readFully(chunkBytes)
 
               if (targetWorkerID == ctx.workerWorkerID) {
-                // 내 거면 바로 씀
+                // 내 데이터도 로컬 파일에 안전하게 씀 (Merge때 사용)
                 partitionStreams(seg.partitionId).write(chunkBytes)
               } else {
-                // 남의 거면 (타겟, 파티션ID)별로 버퍼링
                 val bufferKey = (targetWorkerID, seg.partitionId)
                 val buf = networkBuffers.getOrElseUpdate(bufferKey, new ByteArrayOutputStream(BATCH_SIZE * 2))
                 buf.write(chunkBytes)
@@ -144,20 +155,21 @@ class ShufflePhase extends WorkerPhase {
       }
 
       networkBuffers.keys.foreach(flushBuffer)
+
+      // 클라이언트(보내는 기능)만 종료. 서버(받는 기능)는 살려둠!
       ctx.networkService.finishSending()
 
-      // --- [Step C] Cleanup & Wait ---
-      println("Waiting for reception...")
-      Thread.sleep(5000)
+      println("Shuffle Phase Logic Complete. Waiting for global sync...")
 
-      generatedChunks.foreach { case (d, i) => d.delete(); i.delete() }
-      tempChunkDir.delete()
+      // [수정] 파일 삭제 코드 제거함 (Merge 단계나 디버깅을 위해 유지)
+      // generatedChunks.foreach(...) -> 삭제 안 함
 
     } finally {
+      // 파일 스트림은 안전하게 닫아줘야 데이터가 저장됨
       for (s <- partitionStreams) if (s != null) {
         s.flush(); s.close()
       }
-      ctx.networkService.shutdown()
+
     }
 
     ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.masterWorkerID))
@@ -165,19 +177,8 @@ class ShufflePhase extends WorkerPhase {
     Merging
   }
 
-  // --- Helper Methods ---
-
-  /**
-   * 정렬된 블록 데이터에서 파티션 경계(Segment)를 찾습니다.
-   * 단순히 순회하면서 파티션 ID가 바뀌는 지점을 기록합니다. (이분 탐색보다 순회가 더 빠를 수 있음)
-   */
-  private def findPartitionSegments(
-                                     sortedData: Array[Array[Byte]],
-                                     ctx: WorkerContext,
-                                     totalPartitions: Int
-                                   ): List[PartitionSegment] = {
+  private def findPartitionSegments(sortedData: Array[Array[Byte]], ctx: WorkerContext): List[PartitionSegment] = {
     val segments = new ListBuffer[PartitionSegment]()
-
     if (sortedData.isEmpty) return segments.toList
 
     var currentPIdx = ctx.findPartitionIndex(sortedData(0).take(Constant.Size.key))
@@ -190,19 +191,14 @@ class ShufflePhase extends WorkerPhase {
       val pIdx = ctx.findPartitionIndex(key)
 
       if (pIdx != currentPIdx) {
-        // 파티션이 바뀌었으므로 이전 구간 기록
         segments += PartitionSegment(currentPIdx, startOffset, count * recordSize)
-
-        // 새 구간 시작
         currentPIdx = pIdx
         startOffset = i * recordSize
         count = 0
       }
       count += 1
     }
-    // 마지막 구간 기록
     segments += PartitionSegment(currentPIdx, startOffset, count * recordSize)
-
     segments.toList
   }
 
@@ -235,13 +231,10 @@ class ShufflePhase extends WorkerPhase {
     try {
       val count = dis.readInt()
       for (_ <- 0 until count) {
-        val pId = dis.readInt()
-        val off = dis.readLong()
-        val len = dis.readInt()
-        segments += PartitionSegment(pId, off, len)
+        segments += PartitionSegment(dis.readInt(), dis.readLong(), dis.readInt())
       }
     } catch {
-      case _: EOFException => // End of file
+      case _: EOFException =>
     } finally {
       dis.close()
     }
@@ -253,13 +246,14 @@ class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     println("[Phase] Merging Started")
 
-    // develop의 executeMerge 로직
-    // 1. ShufflePhase에서 생성된 로컬 파티션 파일들과 수신된 파일(recvFile)을 병합 정렬
-    // 2. 최종 결과 파일 생성
+    // [핵심] 이제 더 이상 받을 데이터가 없으므로 네트워크 서비스를 종료합니다.
+    if (ctx.networkService != null) {
+      println("Shutting down Worker Network Service...")
+      ctx.networkService.shutdown()
+    }
 
-    // (구체적인 Merge Sort 구현은 StorageService 등에 있다고 가정하고 생략하거나 간단히 기술)
-    // val received = new File(ctx.outputDir, "worker_${ctx.workerID}_recv_temp")
-    // StorageService.mergeAndSort(..., ctx.outputDir)
+    // Merge 로직 수행 (기존 로직 유지)
+    // ...
 
     ctx.masterClient.notifyMergeComplete(NotifyRequest(ctx.masterWorkerID))
     println("[Phase] Merging Done.")

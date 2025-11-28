@@ -21,6 +21,8 @@ class MasterState(numWorkers: Int) {
   private val workerStatus = MutableMap[NodeID, WorkerState]()
   private val workerSamples = MutableMap[NodeID, List[Key]]()
 
+  private val shuffleReadyWorkers = scala.collection.mutable.Set[NodeID]()
+
   // 공유 상태 (Volatile로 가시성 확보)
   @volatile var globalSplitters: List[Key] = null
   @volatile var allMasterWorkerIDs: List[NodeID] = List.empty
@@ -67,6 +69,34 @@ class MasterState(numWorkers: Int) {
       return true
     }
     false
+  }
+  
+  /**
+   * [추가] Barrier Logic
+   * 워커가 호출하면, 모든 워커가 준비될 때까지 대기(Block)
+   */
+  def waitForShuffleReady(workerID: NodeID): Boolean = synchronized {
+    shuffleReadyWorkers.add(workerID)
+    logger.info(s"Worker $workerID ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
+
+    // 마지막 주자가 도착하면 모두 깨움
+    if (shuffleReadyWorkers.size == numWorkers) {
+      logger.info("Barrier Reached! Releasing all workers...")
+      notifyAll()
+      return true
+    }
+
+    // 다 모일 때까지 대기
+    while (shuffleReadyWorkers.size < numWorkers) {
+      try {
+        wait()
+      } catch {
+        case e: InterruptedException =>
+          Thread.currentThread().interrupt()
+          return false
+      }
+    }
+    true
   }
 
   /**

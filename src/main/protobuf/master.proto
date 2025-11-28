@@ -58,12 +58,22 @@ message GetGlobalStateReply {
   repeated string allWorkerIds = 2;
 }
 
+message ShuffleReadyRequest {
+    string workerId = 1;
+}
+
+message ShuffleReadyReply {
+    bool allReady = 1;
+}
+
 service MasterService {
   rpc RegisterWorker (RegisterRequest) returns (RegisterReply);
   rpc SubmitSamples (SampleRequest) returns (SampleReply);
 
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc GetGlobalState (GetGlobalStateRequest) returns (GetGlobalStateReply);
+
+    rpc CheckShuffleReady (ShuffleReadyRequest) returns (ShuffleReadyReply);
 
   rpc NotifyShuffleComplete (NotifyRequest) returns (NotifyReply);
   rpc NotifyMergeComplete (NotifyRequest) returns (NotifyReply);

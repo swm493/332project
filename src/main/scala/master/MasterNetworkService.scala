@@ -60,6 +60,14 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     ))
   }
 
+  // Barrier RPC 구현
+  override def checkShuffleReady(req: ShuffleReadyRequest): Future[ShuffleReadyReply] = {
+    // 여기서 스레드가 블로킹됩니다. (MasterApp의 스레드 풀이 충분하므로 안전)
+    val isSuccess = state.waitForShuffleReady(req.workerId)
+
+    Future.successful(ShuffleReadyReply(allReady = isSuccess))
+  }
+
   override def submitSamples(req: SampleRequest): Future[SampleReply] = {
     val samples = req.samples.map(_.key.toByteArray).toList
     state.updateSamples(req.workerId, samples)
