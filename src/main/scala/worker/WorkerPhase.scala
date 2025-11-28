@@ -24,7 +24,7 @@ class SamplingPhase extends WorkerPhase {
     }
 
     val protoSamples = samples.map(k => ProtoKey(ByteString.copyFrom(k))).toSeq
-    ctx.masterClient.submitSamples(SampleRequest(ctx.workerID, protoSamples))
+    ctx.masterClient.submitSamples(SampleRequest(ctx.masterWorkerID, protoSamples))
 
     println(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
     Shuffling // 다음 예상 상태
@@ -44,12 +44,12 @@ class ShufflePhase extends WorkerPhase {
     val localStreams = Array.ofDim[BufferedOutputStream](totalPartitions)
 
     // 내가 받아야 할 임시 파일
-    val recvFile = new File(ctx.outputDir, s"worker_${ctx.workerID}_recv_temp")
+    val recvFile = new File(ctx.outputDir, s"worker_${ctx.workerWorkerID}_recv_temp")
     val recvBos = new BufferedOutputStream(new FileOutputStream(recvFile))
 
     // 1. 생성자에 콜백 함수를 직접 전달합니다.
     ctx.networkService = new WorkerNetworkService(
-      ctx.workerID,
+      ctx.workerWorkerID,
       { record =>
         recvBos.synchronized {
           recvBos.write(record)
@@ -66,7 +66,7 @@ class ShufflePhase extends WorkerPhase {
 
       // 로컬 파일 스트림은 필요할 때 열거나, 미리 열어둠 (여기선 간략화)
       // 로직 최적화를 위해 내 파티션 인덱스 범위 계산
-      val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerID)
+      val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
       val myStartIdx = myWorkerIdx * P
       val myEndIdx = myStartIdx + P
 
@@ -86,7 +86,7 @@ class ShufflePhase extends WorkerPhase {
           if (pIdx >= 0 && pIdx < totalPartitions) {
             val targetWorkerID = ctx.allWorkerIDs(pIdx / P)
 
-            if (targetWorkerID == ctx.workerID) {
+            if (targetWorkerID == ctx.workerWorkerID) {
               // 내 담당 파티션이면 로컬 파일에 바로 씀
               localStreams(pIdx).write(record)
             } else {
@@ -111,7 +111,7 @@ class ShufflePhase extends WorkerPhase {
       ctx.networkService.shutdown()
     }
 
-    ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.workerID))
+    ctx.masterClient.notifyShuffleComplete(NotifyRequest(ctx.masterWorkerID))
     println("[Phase] Shuffling Done.")
     Merging
   }
@@ -129,7 +129,7 @@ class MergePhase extends WorkerPhase {
     // val received = new File(ctx.outputDir, "worker_${ctx.workerID}_recv_temp")
     // StorageService.mergeAndSort(..., ctx.outputDir)
 
-    ctx.masterClient.notifyMergeComplete(NotifyRequest(ctx.workerID))
+    ctx.masterClient.notifyMergeComplete(NotifyRequest(ctx.masterWorkerID))
     println("[Phase] Merging Done.")
     Done
   }

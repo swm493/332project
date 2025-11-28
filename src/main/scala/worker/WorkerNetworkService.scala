@@ -7,7 +7,7 @@ import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import java.util.logging.Logger
 import com.google.protobuf.ByteString
 import scala.concurrent.ExecutionContext
-import services.NodeIp
+import services.NodeID
 
 /**
  * Worker 간의 데이터 통신(Shuffle)을 담당하는 서비스입니다.
@@ -15,7 +15,7 @@ import services.NodeIp
  * * @param selfID         자신의 IP:Port (서버 포트 결정용)
  * @param onDataReceived 외부(WorkerState 등)로 데이터를 전달할 콜백 함수
  */
-class WorkerNetworkService(selfID: NodeIp, onDataReceived: Array[Byte] => Unit)(implicit ec: ExecutionContext)
+class WorkerNetworkService(selfID: NodeID, onDataReceived: Array[Byte] => Unit)(implicit ec: ExecutionContext)
   extends WorkerServiceGrpc.WorkerService {
 
   private val logger = Logger.getLogger(classOf[WorkerNetworkService].getName)
@@ -65,10 +65,10 @@ class WorkerNetworkService(selfID: NodeIp, onDataReceived: Array[Byte] => Unit)(
   // --- Client Side (데이터 전송 로직) ---
   // (기존 로직 유지: 다른 Worker에게 데이터를 보낼 때 사용)
 
-  private val channels = new ConcurrentHashMap[NodeIp, ManagedChannel]()
-  private val observers = new ConcurrentHashMap[NodeIp, StreamObserver[ShuffleRecord]]()
+  private val channels = new ConcurrentHashMap[NodeID, ManagedChannel]()
+  private val observers = new ConcurrentHashMap[NodeID, StreamObserver[ShuffleRecord]]()
 
-  def sendRecord(targetWorkerID: NodeIp, record: Array[Byte]): Unit = {
+  def sendRecord(targetWorkerID: NodeID, record: Array[Byte]): Unit = {
     // 1. 채널 생성 (Lazy init)
     channels.computeIfAbsent(targetWorkerID, id => {
       val Array(host, p) = id.split(":")

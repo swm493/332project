@@ -24,12 +24,8 @@ object WorkerApp {
     }
 
     val conf = config.get
-    val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
-    val selfPort = 8080;
-    val workerID = s"$selfIP:$selfPort"
-
+    
     val workerNode = new WorkerNode(
-      workerID,
       conf.masterAddress,
       conf.inputDirs,
       conf.outputDir

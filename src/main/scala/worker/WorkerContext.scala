@@ -2,21 +2,22 @@ package worker
 
 import sorting.worker._
 import sorting.master._
-import services.{Key, NodeIp, Constant}
+import services.{Key, NodeID, Constant}
 import services.RecordOrdering.ordering.compare
 
 /**
  * Worker의 모든 단계(Phase)에서 공통으로 필요한 데이터 및 유틸리티입니다.
  */
 class WorkerContext(
-                     val workerID: NodeIp,
+                     val masterWorkerID: NodeID,
+                     val workerWorkerID: NodeID,
                      val inputDirs: List[String],
                      val outputDir: String,
                      val masterClient: MasterServiceGrpc.MasterServiceBlockingStub
                    ) {
   // 실행 중 변경되는 정보들 (Mutable)
   var splitters: List[Key] = _
-  var allWorkerIDs: List[NodeIp] = _
+  var allWorkerIDs: List[NodeID] = _
 
   // WorkerNetworkService는 ShufflePhase에서 생성 및 관리
   var networkService: WorkerNetworkService = _

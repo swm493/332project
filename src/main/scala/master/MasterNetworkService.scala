@@ -5,7 +5,7 @@ import com.google.protobuf.ByteString
 import java.util.logging.Logger
 
 // 프로젝트 의존성 (환경에 맞게 import 경로 확인 필요)
-import services.{Key, NodeIp}
+import services.{Key, NodeID}
 import services.WorkerState._
 import sorting.master._
 import sorting.common._
@@ -22,13 +22,13 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
 
   override def registerWorker(req: RegisterRequest): Future[RegisterReply] = {
     // State에 등록 위임
-    val (assignedState, splitters, allIds) = state.registerWorker(req.workerId)
+    val (assignedState, splitters, allIds) = state.registerWorker(req.masterWorkerID, req.workerWorkerID)
 
     // 응답 객체 생성
     Future.successful(RegisterReply(
       assignedState = assignedState.id,
       splitters = toProtoKeys(splitters),
-      allWorkerIds = allIds
+      allWorkerIDs = allIds
     ))
   }
 

@@ -4,13 +4,14 @@ package sorting;
 import "common.proto";
 
 message RegisterRequest {
-  string workerId = 1;
+  string masterWorkerID = 1;
+  string workerWorkerID = 2;
 }
 
 message RegisterReply {
   int32 assignedState = 1;
   repeated ProtoKey splitters = 2;
-  repeated string allWorkerIds = 3;
+  repeated string allWorkerIDs = 3;
 }
 
 message SampleRequest {

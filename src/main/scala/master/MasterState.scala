@@ -4,9 +4,10 @@ import java.util.logging.Logger
 import scala.collection.mutable.{ListBuffer, Map => MutableMap}
 
 // 프로젝트 의존성
-import services.{Key, NodeIp, Constant}
+import services.{Key, NodeID, Constant}
 import services.WorkerState._
 import services.RecordOrdering.ordering // 정렬 기준
+import services.Constant.Ports
 
 /**
  * Master의 상태 데이터와 비즈니스 로직(스플리터 계산 등)을 관리하는 클래스입니다.
@@ -17,44 +18,45 @@ class MasterState(numWorkers: Int) {
   private val logger = Logger.getLogger(classOf[MasterState].getName)
 
   // 워커 상태 및 데이터 저장소
-  private val workerStatus = MutableMap[NodeIp, WorkerState]()
-  private val workerSamples = MutableMap[NodeIp, List[Key]]()
+  private val workerStatus = MutableMap[NodeID, WorkerState]()
+  private val workerSamples = MutableMap[NodeID, List[Key]]()
 
   // 공유 상태 (Volatile로 가시성 확보)
   @volatile var globalSplitters: List[Key] = null
-  @volatile var allNodeIps: List[NodeIp] = List.empty
+  @volatile var allMasterWorkerIDs: List[NodeID] = List.empty
+  @volatile var allWorkerWorkerIDs: List[NodeID] = List.empty
 
   /**
    * 워커 등록 처리
    * 기존 상태가 있다면 복구(Recovery) 로직을 수행합니다.
    */
-  def registerWorker(NodeIp: NodeIp): (WorkerState, List[Key], List[NodeIp]) = synchronized {
-    if (!workerStatus.contains(NodeIp)) {
-      allNodeIps = NodeIp :: allNodeIps
+  def registerWorker(masterWorkerID: NodeID, workerWorkerID: NodeID): (WorkerState, List[Key], List[NodeID]) = synchronized {
+    if (!workerStatus.contains(masterWorkerID)) {
+      allMasterWorkerIDs = masterWorkerID :: allMasterWorkerIDs
+      allWorkerWorkerIDs = workerWorkerID :: allWorkerWorkerIDs
     }
-
     // 복구 로직: 이미 글로벌 상태(Splitter)가 생성되어 있다면 해당 단계로 진입
     val assignedState = if (globalSplitters != null) {
-      val savedState = workerStatus.getOrElse(NodeIp, Shuffling)
+      val savedState = workerStatus.getOrElse(masterWorkerID, Shuffling)
       // 이미 Merging 이상 진행 중이라면 상태 유지, 아니라면 Shuffling 부터 시작
       if (savedState.id >= Merging.id) savedState else Shuffling
     } else {
-      workerStatus(NodeIp) = Sampling
+      workerStatus(masterWorkerID) = Sampling
       Sampling
     }
 
-    logger.info(s"Worker $NodeIp registered. State: $assignedState. Workers: ${workerStatus.size}/$numWorkers")
+    logger.info(s"Worker $masterWorkerID registered. State: $assignedState. Workers: ${workerStatus.size}/$numWorkers")
 
     // 현재 진행 단계에 맞춰 Splitter 제공 여부 결정
     val splittersToSend = if (assignedState.id >= Shuffling.id) globalSplitters else null
-    (assignedState, splittersToSend, allNodeIps)
+    (assignedState, splittersToSend, allWorkerWorkerIDs)
   }
 
   /**
    * 샘플 제출 처리
    * 모든 워커의 샘플이 모이면 즉시 Splitter를 계산합니다.
    */
-  def updateSamples(NodeIp: NodeIp, samples: List[Key]): Boolean = synchronized {
+  def updateSamples(NodeIp: NodeID, samples: List[Key]): Boolean = synchronized {
     workerSamples(NodeIp) = samples
     workerStatus(NodeIp) = Shuffling
 
@@ -70,7 +72,7 @@ class MasterState(numWorkers: Int) {
   /**
    * 셔플 완료 상태 업데이트
    */
-  def updateShuffleStatus(NodeIp: NodeIp): Boolean = synchronized {
+  def updateShuffleStatus(NodeIp: NodeID): Boolean = synchronized {
     workerStatus(NodeIp) = Merging
     // 모든 워커가 Merging 상태인지 확인 (다음 단계 트리거용)
     workerStatus.values.forall(_ == Merging)
@@ -79,7 +81,7 @@ class MasterState(numWorkers: Int) {
   /**
    * 병합 완료 상태 업데이트
    */
-  def updateMergeStatus(NodeIp: NodeIp): Boolean = synchronized {
+  def updateMergeStatus(NodeIp: NodeID): Boolean = synchronized {
     workerStatus(NodeIp) = Done
     // 모든 워커가 Done 상태인지 확인
     workerStatus.values.forall(_ == Done)
@@ -88,15 +90,15 @@ class MasterState(numWorkers: Int) {
   /**
    * 현재 워커 상태 조회 (Heartbeat용)
    */
-  def getWorkerStatus(NodeIp: NodeIp): WorkerState = synchronized {
+  def getWorkerStatus(NodeIp: NodeID): WorkerState = synchronized {
     workerStatus.getOrElse(NodeIp, Failed)
   }
 
   /**
    * 글로벌 상태 데이터 조회 (GetGlobalState용)
    */
-  def getGlobalStateData: (List[Key], List[NodeIp]) = synchronized {
-    (globalSplitters, allNodeIps)
+  def getGlobalStateData: (List[Key], List[NodeID]) = synchronized {
+    (globalSplitters, allMasterWorkerIDs)
   }
 
   /**

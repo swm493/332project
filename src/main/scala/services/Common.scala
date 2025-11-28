@@ -8,7 +8,7 @@ package services
 type Key = Array[Byte]
 
 // 워커 ID (예: "192.168.0.1:8081")
-type NodeIp = String
+type NodeID = String
 
 object Constant {
   object Size {
@@ -19,6 +19,11 @@ object Constant {
   }
   object Sample {
     def n: Int = 1000
+  }
+
+  object Ports {
+    def MasterWorkerPort: Int = 1557
+    def WorkerWorkerPort: Int = 6974
   }
 }
 

@@ -2,18 +2,24 @@ package worker
 
 import io.grpc.ManagedChannelBuilder
 import java.util.logging.Logger
-import services.{NodeIp, WorkerState}
+import services.{NodeID, WorkerState}
 import services.WorkerState._
 import sorting.common._
 import sorting.worker._
 import sorting.master._
+import services.Constant.Ports
 
 /**
  * WorkerNode는 상태 관리와 전체 수명 주기를 담당합니다. (Orchestrator)
  * 구체적인 작업 로직은 WorkerPhase 구현체들에게 위임합니다.
  */
-class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[String], outputDir: String) {
+class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String) {
   private val logger = Logger.getLogger(classOf[WorkerNode].getName)
+
+  private val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
+
+  private val MasterWorkerID = s"${selfIP}${Ports.MasterWorkerPort}"
+  private val WorkerWorkerID = s"${selfIP}${Ports.WorkerWorkerPort}"
 
   // 1. Master 연결 설정
   private val Array(host, port) = masterAddress.split(":")
@@ -21,7 +27,7 @@ class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[St
   private val masterClient = MasterServiceGrpc.blockingStub(channel)
 
   // 2. 컨텍스트 생성 (Phases 간 공유될 데이터 및 헬퍼)
-  private val context = new WorkerContext(workerID, inputDirs, outputDir, masterClient)
+  private val context = new WorkerContext(MasterWorkerID, WorkerWorkerID, inputDirs, outputDir, masterClient)
 
   // 3. 상태별 실행기(Strategy) 매핑
   private val phases: Map[WorkerState, WorkerPhase] = Map(
@@ -31,7 +37,8 @@ class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[St
   )
 
   def start(): Unit = {
-    logger.info(s"Worker $workerID starting...")
+
+    logger.info(s"Worker $MasterWorkerID starting...")
     var currentState = register()
 
     while (currentState != Done && currentState != Failed) {
@@ -79,13 +86,13 @@ class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[St
   }
 
   private def register(): WorkerState = {
-    val res = masterClient.registerWorker(RegisterRequest(workerID))
-    updateContextData(res.splitters, res.allWorkerIds)
+    val res = masterClient.registerWorker(RegisterRequest(MasterWorkerID, WorkerWorkerID))
+    updateContextData(res.splitters, res.allWorkerIDs)
     WorkerState(res.assignedState)
   }
 
   private def pollHeartbeat(): WorkerState = {
-    val res = masterClient.heartbeat(HeartbeatRequest(workerID))
+    val res = masterClient.heartbeat(HeartbeatRequest(MasterWorkerID))
     // Heartbeat는 가볍게 상태만 체크, 데이터가 필요하면 fetchGlobalState 사용
     val serverState = WorkerState.withName(res.state.name)
     serverState
@@ -95,7 +102,7 @@ class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[St
   private def fetchGlobalState(): Unit = {
     try {
       logger.info("Fetching global state from master...")
-      val res = masterClient.getGlobalState(GetGlobalStateRequest(workerID))
+      val res = masterClient.getGlobalState(GetGlobalStateRequest(MasterWorkerID))
       updateContextData(res.splitters, res.allWorkerIds)
     } catch {
       case e: Exception => logger.warning(s"Failed to fetch global state: ${e.getMessage}")
