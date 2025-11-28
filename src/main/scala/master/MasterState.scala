@@ -98,7 +98,7 @@ class MasterState(numWorkers: Int) {
    * 글로벌 상태 데이터 조회 (GetGlobalState용)
    */
   def getGlobalStateData: (List[Key], List[NodeID]) = synchronized {
-    (globalSplitters, allMasterWorkerIDs)
+    (globalSplitters, allWorkerWorkerIDs)
   }
 
   /**
