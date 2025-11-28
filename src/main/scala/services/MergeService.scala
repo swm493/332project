@@ -4,8 +4,6 @@ import scala.collection.mutable
 
 object MergeService {
 
-  val KEY_SIZE = 10
-
   /**
    * 바이트 배열 비교 로직 (Unsigned Lexicographical)
    * * Scala/Java의 Byte는 Signed(-128 ~ 127)이므로,
@@ -17,7 +15,7 @@ object MergeService {
       val (bytesB, _) = y
 
       var i = 0
-      while (i < KEY_SIZE) {
+      while (i < services.Constant.Size.key) {
         val a = bytesA(i) & 0xFF
         val b = bytesB(i) & 0xFF
         if (a != b) return a - b

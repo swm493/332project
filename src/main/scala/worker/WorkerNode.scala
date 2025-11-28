@@ -1,24 +1,27 @@
 package worker
 
 import io.grpc.ManagedChannelBuilder
-import services.WorkerState
-import sorting.sorting.{HeartbeatRequest, RegisterRequest, SortingServiceGrpc}
-import services.WorkerState.*
-import worker.*
-
 import java.util.logging.Logger
+import services.{NodeIp, WorkerState}
+import services.WorkerState._
+import sorting.common._
+import sorting.worker._
+import sorting.master._
 
-class WorkerNode(val workerID: String, masterAddress: String, inputDirs: List[String], outputDir: String) {
-
+/**
+ * WorkerNode는 상태 관리와 전체 수명 주기를 담당합니다. (Orchestrator)
+ * 구체적인 작업 로직은 WorkerPhase 구현체들에게 위임합니다.
+ */
+class WorkerNode(val workerID: NodeIp, masterAddress: String, inputDirs: List[String], outputDir: String) {
   private val logger = Logger.getLogger(classOf[WorkerNode].getName)
 
-  // 1. 연결 설정
+  // 1. Master 연결 설정
   private val Array(host, port) = masterAddress.split(":")
   private val channel = ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build
-  private val masterClient = SortingServiceGrpc.blockingStub(channel)
+  private val masterClient = MasterServiceGrpc.blockingStub(channel)
 
-  // 2. 컨텍스트 생성 (Phases 간 공유될 데이터)
-  private val context = WorkerContext(workerID, inputDirs, outputDir, masterClient)
+  // 2. 컨텍스트 생성 (Phases 간 공유될 데이터 및 헬퍼)
+  private val context = new WorkerContext(workerID, inputDirs, outputDir, masterClient)
 
   // 3. 상태별 실행기(Strategy) 매핑
   private val phases: Map[WorkerState, WorkerPhase] = Map(
@@ -42,12 +45,21 @@ class WorkerNode(val workerID: String, masterAddress: String, inputDirs: List[St
             currentState = pollHeartbeat()
 
           case s if phases.contains(s) =>
-            // 해당 단계의 로직 실행 (Phase 클래스에 위임)
-            val nextExpected = phases(s).execute(context)
+            // [Logic Merge] Shuffling 단계인데 Splitter 정보가 없으면 받아옴 (develop 로직)
+            if (s == Shuffling && !context.isReadyForShuffle) {
+              fetchGlobalState()
+            }
 
-            // 실행 후, 마스터가 다음 단계를 승인할 때까지 대기
-            waitForState(nextExpected)
-            currentState = nextExpected
+            // 데이터가 준비되었으면 로직 실행
+            if (s != Shuffling || context.isReadyForShuffle) {
+              val nextExpected = phases(s).execute(context)
+              waitForState(nextExpected)
+              currentState = nextExpected
+            } else {
+              // 준비 안됐으면 대기
+              Thread.sleep(1000)
+              currentState = pollHeartbeat()
+            }
 
           case _ =>
             logger.warning(s"Unknown state: $currentState")
@@ -56,8 +68,10 @@ class WorkerNode(val workerID: String, masterAddress: String, inputDirs: List[St
       } catch {
         case e: Exception =>
           logger.severe(s"Error in loop: ${e.getMessage}")
-          Thread.sleep(5000) // 재시도 대기
-          currentState = Unregistered // 연결 재수립 시도
+          e.printStackTrace()
+          Thread.sleep(5000)
+          // 에러 발생 시 재등록 시도 혹은 대기
+          currentState = pollHeartbeat()
       }
     }
 
@@ -66,19 +80,30 @@ class WorkerNode(val workerID: String, masterAddress: String, inputDirs: List[St
 
   private def register(): WorkerState = {
     val res = masterClient.registerWorker(RegisterRequest(workerID))
-    // 컨텍스트 업데이트 (Splitter 정보 등)
     updateContextData(res.splitters, res.allWorkerIds)
     WorkerState(res.assignedState)
   }
 
   private def pollHeartbeat(): WorkerState = {
     val res = masterClient.heartbeat(HeartbeatRequest(workerID))
-    updateContextData(res.splitters, res.allWorkerIds)
-    // Proto Enum -> Service Enum 매핑 로직 필요
-    WorkerState.withName(res.state.name)
+    // Heartbeat는 가볍게 상태만 체크, 데이터가 필요하면 fetchGlobalState 사용
+    val serverState = WorkerState.withName(res.state.name)
+    serverState
+  }
+
+  // [New Feature from develop] 대용량 메타데이터 별도 요청
+  private def fetchGlobalState(): Unit = {
+    try {
+      logger.info("Fetching global state from master...")
+      val res = masterClient.getGlobalState(GetGlobalStateRequest(workerID))
+      updateContextData(res.splitters, res.allWorkerIds)
+    } catch {
+      case e: Exception => logger.warning(s"Failed to fetch global state: ${e.getMessage}")
+    }
   }
 
   private def waitForState(target: WorkerState): Unit = {
+    // 이미 타겟 상태거나 완료된 상태면 즉시 리턴
     var s = pollHeartbeat()
     while(s != target && s != Done && s != Failed) {
       Thread.sleep(1000)
@@ -86,7 +111,7 @@ class WorkerNode(val workerID: String, masterAddress: String, inputDirs: List[St
     }
   }
 
-  private def updateContextData(splitters: Seq[sorting.sorting.ProtoKey], ids: Seq[String]): Unit = {
+  private def updateContextData(splitters: Seq[ProtoKey], ids: Seq[String]): Unit = {
     if (splitters.nonEmpty) context.splitters = splitters.map(_.key.toByteArray).toList
     if (ids.nonEmpty) context.allWorkerIDs = ids.toList
   }

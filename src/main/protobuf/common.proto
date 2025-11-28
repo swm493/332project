@@ -1,0 +1,6 @@
+syntax = "proto3";
+package sorting;
+
+message ProtoKey {
+  bytes key = 1;
+}

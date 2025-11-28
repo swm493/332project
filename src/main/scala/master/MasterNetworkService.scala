@@ -1,21 +1,30 @@
 package master
 
 import scala.concurrent.{ExecutionContext, Future}
+import com.google.protobuf.ByteString
+import java.util.logging.Logger
+
+// 프로젝트 의존성 (환경에 맞게 import 경로 확인 필요)
 import services.{Key, NodeIp}
 import services.WorkerState._
-import sorting.sorting._
-import com.google.protobuf.ByteString
+import sorting.master._
+import sorting.common._
 
 /**
  * gRPC 통신 규약만 처리하는 클래스입니다.
- * 실제 로직은 MasterState에 위임합니다.
+ * 실제 데이터 처리 및 상태 관리는 MasterState에 위임합니다.
+ * develop 브랜치의 getGlobalState 등의 신규 인터페이스가 통합되었습니다.
  */
-class MasterGrpcService(state: MasterState)(implicit ec: ExecutionContext)
-  extends SortingServiceGrpc.SortingService {
+class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
+  extends MasterServiceGrpc.MasterService {
+
+  private val logger = Logger.getLogger(classOf[MasterNetworkService].getName)
 
   override def registerWorker(req: RegisterRequest): Future[RegisterReply] = {
+    // State에 등록 위임
     val (assignedState, splitters, allIds) = state.registerWorker(req.workerId)
 
+    // 응답 객체 생성
     Future.successful(RegisterReply(
       assignedState = assignedState.id,
       splitters = toProtoKeys(splitters),
@@ -26,20 +35,28 @@ class MasterGrpcService(state: MasterState)(implicit ec: ExecutionContext)
   override def heartbeat(req: HeartbeatRequest): Future[HeartbeatReply] = {
     val s = state.getWorkerStatus(req.workerId)
 
-    // 상태별 응답 데이터 구성 로직 (View Logic)
-    val (responseState, splitters, ids) = s match {
+    // [Logic Merge] develop 브랜치의 로직 반영
+    // Shuffling 단계지만 아직 Splitter가 준비되지 않았다면 Waiting 상태로 응답
+    val responseState = s match {
       case Shuffling if !state.isShufflingReady =>
-        (HeartbeatReply.WorkerState.Waiting, null, null)
-      case Shuffling =>
-        (HeartbeatReply.WorkerState.Shuffling, state.globalSplitters, state.allWorkerIDs)
+        HeartbeatReply.WorkerState.Waiting
       case _ =>
-        (HeartbeatReply.WorkerState.fromName(s.toString).get, null, null)
+        HeartbeatReply.WorkerState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerState.Unregistered)
     }
 
+    // Heartbeat는 가볍게 상태만 반환 (데이터 전송 최소화)
     Future.successful(HeartbeatReply(
-      state = responseState,
+      state = responseState
+    ))
+  }
+
+  // [New Feature from develop] 대용량 상태 정보(Splitter 등)를 별도로 요청하는 메서드
+  override def getGlobalState(req: GetGlobalStateRequest): Future[GetGlobalStateReply] = {
+    val (splitters, allIds) = state.getGlobalStateData
+
+    Future.successful(GetGlobalStateReply(
       splitters = toProtoKeys(splitters),
-      allWorkerIds = if (ids != null) ids else Seq.empty
+      allWorkerIds = if (allIds != null) allIds else Seq.empty
     ))
   }
 
@@ -59,7 +76,7 @@ class MasterGrpcService(state: MasterState)(implicit ec: ExecutionContext)
     Future.successful(NotifyReply(ack = true))
   }
 
-  // 유틸리티
+  // Helper: List[Key] -> Seq[ProtoKey] 변환
   private def toProtoKeys(keys: List[Key]): Seq[ProtoKey] = {
     if (keys == null) Seq.empty
     else keys.map(k => ProtoKey(ByteString.copyFrom(k)))

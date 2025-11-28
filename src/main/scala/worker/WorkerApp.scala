@@ -24,10 +24,6 @@ object WorkerApp {
     }
 
     val conf = config.get
-
-    // (project.sorting.2025.pptx - "do not assume a specific port")
-    // 워커도 셔플 데이터를 받기 위한 포트가 필요합니다.
-    // 여기서는 간단히 자신의 IP와 임의의 포트(예: 8081)를 사용합니다.
     val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
     val selfPort = 8080;
     val workerID = s"$selfIP:$selfPort"
