@@ -1,6 +1,17 @@
 syntax = "proto3";
 package sorting;
 
+message NodeAddress {
+  string ip = 1;
+  int32 port = 2;
+}
+
+message WorkerEndpoint {
+  string id = 1;
+  NodeAddress address = 2;
+}
+
+// (기존 코드 호환용) 정렬 키 데이터 정의
 message ProtoKey {
   bytes key = 1;
 }

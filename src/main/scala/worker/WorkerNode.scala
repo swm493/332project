@@ -1,7 +1,6 @@
 package worker
 
 import io.grpc.{ManagedChannelBuilder, Server, ServerBuilder}
-
 import java.util.logging.Logger
 import scala.concurrent.ExecutionContext
 import services.WorkerState
@@ -10,33 +9,25 @@ import sorting.common.*
 import sorting.master.*
 import services.Constant.Ports
 import sorting.worker.*
+import services.{PartitionID, Port, NetworkUtils}
 
-/**
- * WorkerNode는 상태 관리, 서버 수명 주기(Lifecycle), 전체 흐름을 담당합니다.
- * MasterNode와 동일한 패턴으로 리팩토링되었습니다.
- */
 class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
   private val logger = Logger.getLogger(classOf[WorkerNode].getName)
-
-  private val selfIP = services.NetworkUtils.findLocalIpAddress()
-
-  private val MasterWorkerID = s"${selfIP}:${Ports.MasterWorkerPort}"
-  private val WorkerWorkerID = s"${selfIP}:${Ports.WorkerWorkerPort}"
 
   private val Array(host, port) = masterAddress.split(":")
   private val channel = ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build
   private val masterClient = MasterServiceGrpc.blockingStub(channel)
 
-  private val context = new WorkerContext(MasterWorkerID, WorkerWorkerID, inputDirs, outputDir, masterClient)
+  private val context = new WorkerContext(inputDirs, outputDir, masterClient)
 
   private var server: Server = _
 
-  private val onDataReceived = (partitionID: Int, data: Array[Byte]) => {
+  private val onDataReceived = (partitionID: PartitionID, data: Array[Byte]) => {
     logger.info(s"Received partition $partitionID data (${data.length} bytes)")
     context.handleReceivedData(partitionID, data)
   }
 
-  private val networkService = new WorkerNetworkService(WorkerWorkerID, onDataReceived)
+  private val networkService = new WorkerNetworkService(onDataReceived)
 
   private val phases: Map[WorkerState, WorkerPhase] = Map(
     Sampling -> new SamplingPhase(),
@@ -47,14 +38,16 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   def start(): Unit = {
     context.networkService = this.networkService
 
-    // [리팩토링] 서버 시작 로직이 Node로 이동
-    server = ServerBuilder.forPort(Ports.WorkerWorkerPort)
+    server = ServerBuilder.forPort(0) // Port 0 = Random Port
       .addService(WorkerServiceGrpc.bindService(networkService, ec))
       .build
       .start()
 
-    logger.info(s"Worker server started on $WorkerWorkerID")
-    logger.info(s"Worker $MasterWorkerID connecting to Master at $masterAddress")
+    val actualPort: Port = server.getPort()
+    context.updateSelfPort(actualPort)
+
+    logger.info(s"Worker server started on ${context.selfAddress}")
+    logger.info(s"Worker connecting to Master at $masterAddress")
 
     try {
       runWorkerLoop()
@@ -64,7 +57,18 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   }
 
   private def runWorkerLoop(): Unit = {
-    var currentState = register()
+    var currentState = WorkerState.Unregistered
+
+    while (currentState == WorkerState.Unregistered) {
+      try {
+        currentState = register()
+      } catch {
+        case e: Exception =>
+          logger.warning(s"Failed to register with Master (${masterAddress}): ${e.getMessage}")
+          logger.info("Retrying in 5 seconds...")
+          try { Thread.sleep(5000) } catch { case _: InterruptedException => }
+      }
+    }
 
     while (currentState != Done && currentState != Failed) {
       try {
@@ -108,24 +112,35 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     logger.info("Worker shutting down...")
     if (server != null) server.shutdown()
     if (channel != null) channel.shutdown()
-    if (networkService != null) networkService.closeChannels() // 클라이언트 채널 정리
+    if (networkService != null) networkService.closeChannels()
   }
 
   private def register(): WorkerState = {
-    val res = masterClient.registerWorker(RegisterRequest(MasterWorkerID, WorkerWorkerID))
-    updateContextData(res.splitters, res.allWorkerIDs)
+    val req = RegisterRequest(
+      workerAddress = Some(sorting.common.NodeAddress(context.selfAddress.ip, context.selfAddress.port))
+    )
+    val res = masterClient.registerWorker(req)
+
+    if (res.workerEndpoint.isDefined) {
+      context.myEndpoint = toDomain(res.workerEndpoint.get)
+      logger.info(s"Registered as Worker ID ${context.myEndpoint.id}")
+    }
+
+    updateContextData(res.splitters, res.allWorkerEndpoints)
     WorkerState(res.assignedState)
   }
 
   private def pollHeartbeat(): WorkerState = {
-    val res = masterClient.heartbeat(HeartbeatRequest(MasterWorkerID))
+    val req = HeartbeatRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(context.myEndpoint)))
+    val res = masterClient.heartbeat(req)
     WorkerState.withName(res.state.name)
   }
 
   private def fetchGlobalState(): Unit = {
     try {
-      val res = masterClient.getGlobalState(GetGlobalStateRequest(MasterWorkerID))
-      updateContextData(res.splitters, res.allWorkerIds)
+      val req = GetGlobalStateRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(context.myEndpoint)))
+      val res = masterClient.getGlobalState(req)
+      updateContextData(res.splitters, res.allWorkerEndpoints)
     } catch {
       case e: Exception => logger.warning(s"Failed to fetch global state: ${e.getMessage}")
     }
@@ -139,8 +154,17 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     }
   }
 
-  private def updateContextData(splitters: Seq[ProtoKey], ids: Seq[String]): Unit = {
-    if (splitters.nonEmpty) context.splitters = splitters.map(_.key.toByteArray).toList
-    if (ids.nonEmpty) context.allWorkerIDs = ids.toList
+  private def updateContextData(splitters: Seq[ProtoKey], endpoints: Seq[sorting.common.WorkerEndpoint]): Unit = {
+    if (splitters.nonEmpty) {
+      context.splitters = splitters.map(_.key.toByteArray).toList
+    }
+    if (endpoints.nonEmpty) {
+      context.allWorkerEndpoints = endpoints.map(toDomain).toList
+    }
+  }
+
+  private def toDomain(proto: sorting.common.WorkerEndpoint): services.WorkerEndpoint = {
+    val addr = proto.address.get
+    services.WorkerEndpoint(proto.id.toInt, services.NodeAddress(addr.ip, addr.port))
   }
 }

@@ -1,95 +1,110 @@
 package master
 
 import services.WorkerState
-
 import java.util.logging.Logger
 import scala.collection.mutable
-import scala.collection.mutable.{ListBuffer, Map as MutableMap}
+import scala.collection.mutable.{ListBuffer, ArrayBuffer, Map as MutableMap}
 
 // 프로젝트 의존성
-import services.{Key, NodeID, Constant}
+import services.{Key, WorkerEndpoint, NodeAddress, Constant, ID, IP}
 import services.WorkerState._
-import services.RecordOrdering.ordering // 정렬 기준
-import services.Constant.Ports
+import services.RecordOrdering.ordering
 
 /**
- * Master의 상태 데이터와 비즈니스 로직(스플리터 계산 등)을 관리하는 클래스입니다.
- * 모든 동기화(synchronized) 처리는 이곳에서 담당합니다.
- * develop 브랜치의 핵심 로직(calculateSplitters)이 포함되어 있습니다.
+ * Master의 상태 데이터와 비즈니스 로직을 관리하는 클래스입니다.
+ * ID, IP 등의 타입 별칭을 적용하여 가독성을 높였습니다.
  */
 class MasterState(numWorkers: Int) {
   private val logger = Logger.getLogger(classOf[MasterState].getName)
 
-  // 워커 상태 및 데이터 저장소
-  private val workerStatus = mutable.Map[NodeID, WorkerState]()
-  private val workerSamples = mutable.Map[NodeID, List[Key]]()
+  // workerStatus(id) : 해당 ID 워커의 상태
+  private val workerStatus = new ArrayBuffer[WorkerState](numWorkers)
 
-  private val shuffleReadyWorkers = scala.collection.mutable.Set[NodeID]()
+  // workerSamples(id) : 해당 ID 워커의 샘플
+  private val workerSamples = new ArrayBuffer[Option[List[Key]]](numWorkers)
 
-  // 공유 상태 (Volatile로 가시성 확보)
-  @volatile private var globalSplitters: List[Key] = null
-  @volatile private var allMasterWorkerIDs: List[NodeID] = List.empty
-  @volatile private var allWorkerWorkerIDs: List[NodeID] = List.empty
+  // 식별자 맵: IP -> Worker ID
+  private val ipToId = mutable.Map[IP, ID]()
+
+  private val shuffleReadyWorkers = scala.collection.mutable.Set[ID]()
+
+  @volatile private var globalSplitters: List[Key] = _
+  private val allWorkerEndpoints = new ArrayBuffer[WorkerEndpoint](numWorkers)
 
   /**
    * 워커 등록 처리
-   * 기존 상태가 있다면 복구(Recovery) 로직을 수행합니다.
    */
-  def registerWorker(masterWorkerID: NodeID, workerWorkerID: NodeID): (WorkerState, List[Key], List[NodeID]) = synchronized {
-    if (!workerStatus.contains(masterWorkerID)) {
-      allMasterWorkerIDs = masterWorkerID :: allMasterWorkerIDs
-      allWorkerWorkerIDs = workerWorkerID :: allWorkerWorkerIDs
+  def registerWorker(workerAddress: NodeAddress): (WorkerState, List[Key], WorkerEndpoint, List[WorkerEndpoint]) = synchronized {
+    // 1. IP 기반 ID 조회 (복구) 또는 신규 생성
+    val workerId: ID = ipToId.getOrElse(workerAddress.ip, {
+      // --- 신규 등록 로직 ---
+      val newId: ID = allWorkerEndpoints.size
+      ipToId(workerAddress.ip) = newId
+
+      workerStatus.addOne(Sampling)
+      workerSamples.addOne(None)
+
+      val newEndpoint = WorkerEndpoint(newId, workerAddress)
+      allWorkerEndpoints.addOne(newEndpoint)
+
+      logger.info(s"New Worker Registered: ID=$newId, IP=${workerAddress.ip}")
+      newId
+    })
+
+    // 2. 포트 정보 갱신 (Dynamic Port Update)
+    val currentEndpoint = allWorkerEndpoints(workerId)
+
+    if (currentEndpoint.address.port != workerAddress.port) {
+      val updatedEndpoint = currentEndpoint.copy(address = workerAddress)
+      allWorkerEndpoints(workerId) = updatedEndpoint
+      logger.info(s"Worker $workerId port updated: ${currentEndpoint.address.port} -> ${workerAddress.port}")
     }
-    // 복구 로직: 이미 글로벌 상태(Splitter)가 생성되어 있다면 해당 단계로 진입
+
+    val myEndpoint = allWorkerEndpoints(workerId)
+
+    // 3. 상태 결정 (Recovery Logic)
     val assignedState = if (globalSplitters != null) {
-      val savedState = workerStatus.getOrElse(masterWorkerID, Shuffling)
-      // 이미 Merging 이상 진행 중이라면 상태 유지, 아니라면 Shuffling 부터 시작
+      val savedState = workerStatus(workerId)
       if (savedState.id >= Merging.id) savedState else Shuffling
     } else {
-      workerStatus(masterWorkerID) = Sampling
+      workerStatus(workerId) = Sampling
       Sampling
     }
 
-    logger.info(s"Worker $masterWorkerID registered. State: $assignedState. Workers: ${workerStatus.size}/$numWorkers")
+    logger.info(s"Worker $workerId (${workerAddress.ip}) registered/recovered. State: $assignedState. Workers: ${ipToId.size}/$numWorkers")
 
-    // 현재 진행 단계에 맞춰 Splitter 제공 여부 결정
     val splittersToSend = if (assignedState.id >= Shuffling.id) globalSplitters else null
-    (assignedState, splittersToSend, allWorkerWorkerIDs)
+
+    (assignedState, splittersToSend, myEndpoint, allWorkerEndpoints.toList)
   }
 
-  /**
-   * 샘플 제출 처리
-   * 모든 워커의 샘플이 모이면 즉시 Splitter를 계산합니다.
-   */
-  def updateSamples(NodeIp: NodeID, samples: List[Key]): Boolean = synchronized {
-    workerSamples(NodeIp) = samples
-    workerStatus(NodeIp) = Shuffling
+  def updateSamples(workerId: ID, samples: List[Key]): Boolean = synchronized {
+    if (!isValidWorker(workerId)) return false
 
-    // 모든 워커의 샘플이 도착했는지 확인
-    if (workerSamples.size == numWorkers) {
+    workerSamples(workerId) = Some(samples)
+    workerStatus(workerId) = Shuffling
+
+    val receivedCount = workerSamples.count(_.isDefined)
+    if (receivedCount == numWorkers) {
       logger.info("All samples received. Calculating splitters...")
-      calculateSplitters() // develop 브랜치의 로직 수행
+      calculateSplitters()
       return true
     }
     false
   }
-  
-  /**
-   * [추가] Barrier Logic
-   * 워커가 호출하면, 모든 워커가 준비될 때까지 대기(Block)
-   */
-  def waitForShuffleReady(workerID: NodeID): Boolean = synchronized {
-    shuffleReadyWorkers.add(workerID)
-    logger.info(s"Worker $workerID ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
 
-    // 마지막 주자가 도착하면 모두 깨움
+  def waitForShuffleReady(workerId: ID): Boolean = synchronized {
+    if (!isValidWorker(workerId)) return false
+
+    shuffleReadyWorkers.add(workerId)
+    logger.info(s"Worker $workerId ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
+
     if (shuffleReadyWorkers.size == numWorkers) {
       logger.info("Barrier Reached! Releasing all workers...")
       notifyAll()
       return true
     }
 
-    // 다 모일 때까지 대기
     while (shuffleReadyWorkers.size < numWorkers) {
       try {
         wait()
@@ -102,69 +117,54 @@ class MasterState(numWorkers: Int) {
     true
   }
 
-  /**
-   * 셔플 완료 상태 업데이트
-   */
-  def updateShuffleStatus(NodeIp: NodeID): Boolean = synchronized {
-    workerStatus(NodeIp) = Merging
-    // 모든 워커가 Merging 상태인지 확인 (다음 단계 트리거용)
-    workerStatus.values.forall(_ == Merging)
+  def updateShuffleStatus(workerId: ID): Boolean = synchronized {
+    if (!isValidWorker(workerId)) return false
+    workerStatus(workerId) = Merging
+    workerStatus.forall(_ == Merging)
   }
 
-  /**
-   * 병합 완료 상태 업데이트
-   */
-  def updateMergeStatus(NodeIp: NodeID): Boolean = synchronized {
-    workerStatus(NodeIp) = Done
-    // 모든 워커가 Done 상태인지 확인
-    workerStatus.values.forall(_ == Done)
+  def updateMergeStatus(workerId: ID): Boolean = synchronized {
+    if (!isValidWorker(workerId)) return false
+    workerStatus(workerId) = Done
+    workerStatus.forall(_ == Done)
   }
 
-  /**
-   * 현재 워커 상태 조회 (Heartbeat용)
-   */
-  def getWorkerStatus(NodeIp: NodeID): WorkerState = synchronized {
-    workerStatus.getOrElse(NodeIp, Failed)
+  def getWorkerStatus(workerId: ID): WorkerState = synchronized {
+    if (isValidWorker(workerId)) workerStatus(workerId) else Failed
   }
 
-  /**
-   * 글로벌 상태 데이터 조회 (GetGlobalState용)
-   */
-  def getGlobalStateData: (List[Key], List[NodeID]) = synchronized {
-    (globalSplitters, allWorkerWorkerIDs)
+  def getGlobalStateData: (List[Key], List[WorkerEndpoint]) = synchronized {
+    (globalSplitters, allWorkerEndpoints.toList)
   }
 
-  /**
-   * Shuffling 단계 진입 가능 여부 (Splitter 계산 완료 여부)
-   */
   def isShufflingReady: Boolean = globalSplitters != null
 
   def isAllWorkersFinished: Boolean = {
-    workerStatus.values.forall(_ == WorkerState.Done)
+    workerStatus.size == numWorkers && workerStatus.forall(_ == WorkerState.Done)
   }
 
-  /**
-   * [Logic Merge] develop 브랜치의 실제 Splitter 계산 로직
-   * 수집된 샘플을 정렬하고 파티션 경계값(Splitter)을 추출합니다.
-   */
+  private def isValidWorker(workerId: ID): Boolean = {
+    val valid = workerId >= 0 && workerId < workerStatus.size
+    if (!valid) {
+      logger.warning(s"Ignored request from unknown or invalid Worker ID: $workerId")
+    }
+    valid
+  }
+
   private def calculateSplitters(): Unit = {
-    // 1. 전체 파티션 수 계산
     val totalPartitions = numWorkers * Constant.Size.partitionPerWorker
     val numSplitters = totalPartitions - 1
 
-    // 2. 모든 워커의 샘플을 하나로 합치고 정렬
-    // (Array 정렬이 성능상 유리할 수 있음)
-    val allSamples = workerSamples.values.flatten.toArray
+    val allSamples = workerSamples.flatten.flatten.toArray
     java.util.Arrays.sort(allSamples, ordering)
 
-    // 3. 등간격으로 Splitter 추출
     val splitters = ListBuffer[Key]()
-    val step = allSamples.length / totalPartitions
-
-    for (i <- 1 to numSplitters) {
-      // 인덱스 경계 체크
-      val idx = Math.min(i * step, allSamples.length - 1)
-      splitters += allSamples(idx)
+    if (allSamples.nonEmpty) {
+      val step = allSamples.length / totalPartitions
+      for (i <- 1 to numSplitters) {
+        val idx = Math.min(i * step, allSamples.length - 1)
+        splitters += allSamples(idx)
+      }
     }
 
     globalSplitters = splitters.toList

@@ -1,36 +1,39 @@
 package worker
 
-import sorting.worker._
-import sorting.master._
-import services.{Key, NodeID, Constant}
+import services.Constant.Ports
+import sorting.master.*
+import services.{Constant, Key, NodeAddress, WorkerEndpoint, IP, Port, ID, PartitionID}
 import services.RecordOrdering.ordering.compare
-import java.util.concurrent.ConcurrentLinkedQueue
-import scala.jdk.CollectionConverters._
 
-/**
- * Worker의 모든 단계(Phase)에서 공통으로 필요한 데이터 및 유틸리티입니다.
- */
+import java.util.concurrent.ConcurrentLinkedQueue
+import scala.jdk.CollectionConverters.*
+
 class WorkerContext(
-                     val masterWorkerID: NodeID,
-                     val workerWorkerID: NodeID,
                      val inputDirs: List[String],
                      val outputDir: String,
                      val masterClient: MasterServiceGrpc.MasterServiceBlockingStub
                    ) {
+  private val selfIP: IP = services.NetworkUtils.findLocalIpAddress()
+
+  // [수정] selfAddress는 IP와 Port 타입을 사용
+  var selfAddress: NodeAddress = NodeAddress(selfIP, 0)
+
+  var myEndpoint: WorkerEndpoint = _
+  var allWorkerEndpoints: List[WorkerEndpoint] = _
   var splitters: List[Key] = _
-  var allWorkerIDs: List[NodeID] = _
 
   var networkService: WorkerNetworkService = _
 
-  @volatile private var dataHandler: (Int, Array[Byte]) => Unit = _
+  // 파티션 ID는 Int (PartitionID)
+  @volatile private var dataHandler: (PartitionID, Array[Byte]) => Unit = _
 
   private val receivedDataQueue = new ConcurrentLinkedQueue[Array[Byte]]()
 
-  /**
-   * [Data Handling] WorkerNetworkService의 콜백에 의해 호출됩니다.
-   * 핸들러가 설정되어 있으면 핸들러에게 위임하고, 없으면 큐에 저장합니다.
-   */
-  def handleReceivedData(partitionID: Int, data: Array[Byte]): Unit = {
+  def updateSelfPort(port: Port): Unit = {
+    selfAddress = NodeAddress(selfIP, port)
+  }
+
+  def handleReceivedData(partitionID: PartitionID, data: Array[Byte]): Unit = {
     if (dataHandler != null) {
       dataHandler(partitionID, data)
     } else {
@@ -40,10 +43,7 @@ class WorkerContext(
     }
   }
 
-  /**
-   * 데이터를 직접 처리할 핸들러를 설정합니다. (예: ShufflePhase에서 파일 쓰기용)
-   */
-  def setCustomDataHandler(handler: (Int, Array[Byte]) => Unit): Unit = {
+  def setCustomDataHandler(handler: (PartitionID, Array[Byte]) => Unit): Unit = {
     this.dataHandler = handler
   }
 
@@ -51,7 +51,7 @@ class WorkerContext(
     receivedDataQueue.asScala.toList
   }
 
-  def isReadyForShuffle: Boolean = splitters != null && allWorkerIDs != null
+  def isReadyForShuffle: Boolean = splitters != null && allWorkerEndpoints != null
 
   def findPartitionIndex(key: Key): Int = {
     if (splitters == null || splitters.isEmpty) return 0

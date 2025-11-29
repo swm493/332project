@@ -6,11 +6,22 @@ import scala.jdk.CollectionConverters._
  * 프로젝트 전체에서 사용되는 공통 타입과 상태를 정의합니다.
  */
 
-// 10 바이트 키 (project.sorting.2025.pptx)
+// [추가] 직관적인 타입 별칭 정의
+type IP = String
+type Port = Int
+type ID = Int           // Worker ID (0-based)
+type PartitionID = Int  // 데이터 파티션 ID
+
+// 10 바이트 키
 type Key = Array[Byte]
 
-// 워커 ID (예: "192.168.0.1:8081")
-type NodeID = String
+case class NodeAddress(ip: IP, port: Port) {
+  override def toString: String = s"$ip:$port"
+}
+
+case class WorkerEndpoint(id: ID, address: NodeAddress)
+
+case class MasterEndpoint(address: NodeAddress)
 
 object Constant {
   object Size {
@@ -25,8 +36,8 @@ object Constant {
   }
 
   object Ports {
-    def MasterWorkerPort: Int = 1557
-    def WorkerWorkerPort: Int = 6974
+    def MasterWorkerPort: Port = 1557
+    def WorkerWorkerPort: Port = 6974
   }
 }
 
@@ -63,7 +74,7 @@ object WorkerState extends Enumeration {
 }
 
 object NetworkUtils {
-  def findLocalIpAddress(): String = {
+  def findLocalIpAddress(): IP = {
     try {
       NetworkInterface.getNetworkInterfaces.asScala
         .filter(i => !i.isLoopback && i.isUp)
@@ -74,5 +85,12 @@ object NetworkUtils {
     } catch {
       case _: Exception => "Unknown-IP"
     }
+  }
+
+  def workerEndpointToProto(domain: services.WorkerEndpoint): sorting.common.WorkerEndpoint = {
+    sorting.common.WorkerEndpoint(
+      id = domain.id.toString,
+      address = Some(sorting.common.NodeAddress(domain.address.ip, domain.address.port))
+    )
   }
 }

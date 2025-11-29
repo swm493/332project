@@ -1,30 +1,33 @@
 package master
 
 import io.grpc.{Server, ServerBuilder}
-import services.Constant.Ports
+import services.{MasterEndpoint, NodeAddress, NetworkUtils}
 
 import scala.concurrent.ExecutionContext
 import java.util.logging.Logger
 import sorting.master.*
-import services.Constant.Ports.*
 
 class MasterNode(executionContext: ExecutionContext, val numWorkers: Int) {
   private val logger = Logger.getLogger(classOf[MasterNode].getName)
 
-  private val MasterWorkerID = s"${services.NetworkUtils.findLocalIpAddress()}:${Ports.MasterWorkerPort}"
-
+  private var masterEndpoint: MasterEndpoint = _
   private var server: Server = _
-  
+
   private val state = new MasterState(numWorkers)
   private val networkService = new MasterNetworkService(state)(executionContext)
 
   def start(): Unit = {
-    server = ServerBuilder.forPort(MasterWorkerPort)
+    server = ServerBuilder.forPort(0)
       .addService(MasterServiceGrpc.bindService(networkService, executionContext))
       .build
       .start
 
-    logger.info(s"Master server started. Listening on $MasterWorkerID")
+    val actualIp = NetworkUtils.findLocalIpAddress()
+    val actualPort = server.getPort
+
+    masterEndpoint = MasterEndpoint(NodeAddress(actualIp, actualPort))
+
+    logger.info(s"Master server started. Listening on ${masterEndpoint.address}")
 
     sys.addShutdownHook { stop() }
     server.awaitTermination()

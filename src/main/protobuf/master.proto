@@ -4,18 +4,18 @@ package sorting;
 import "common.proto";
 
 message RegisterRequest {
-  string masterWorkerID = 1;
-  string workerWorkerID = 2;
+  NodeAddress workerAddress = 1;
 }
 
 message RegisterReply {
   int32 assignedState = 1;
-  repeated ProtoKey splitters = 2;
-  repeated string allWorkerIDs = 3;
+  WorkerEndpoint workerEndpoint = 2;
+  repeated ProtoKey splitters = 3;
+  repeated WorkerEndpoint allWorkerEndpoints = 4;
 }
 
 message SampleRequest {
-  string workerId = 1;
+  WorkerEndpoint workerEndpoint = 1;
   repeated ProtoKey samples = 2;
 }
 
@@ -24,7 +24,7 @@ message SampleReply {
 }
 
 message NotifyRequest {
-  string workerId = 1;
+  WorkerEndpoint workerEndpoint = 1;
   string message = 2;
 }
 
@@ -33,7 +33,7 @@ message NotifyReply {
 }
 
 message HeartbeatRequest {
-  string worker_id = 1;
+  WorkerEndpoint workerEndpoint = 1;
 }
 
 message HeartbeatReply {
@@ -50,20 +50,20 @@ message HeartbeatReply {
 }
 
 message GetGlobalStateRequest {
-  string workerId = 1;
+  WorkerEndpoint workerEndpoint = 1;
 }
 
 message GetGlobalStateReply {
   repeated ProtoKey splitters = 1;
-  repeated string allWorkerIds = 2;
+  repeated WorkerEndpoint allWorkerEndpoints = 2;
 }
 
 message ShuffleReadyRequest {
-    string workerId = 1;
+  WorkerEndpoint workerEndpoint = 1;
 }
 
 message ShuffleReadyReply {
-    bool allReady = 1;
+  bool allReady = 1;
 }
 
 service MasterService {
@@ -73,7 +73,7 @@ service MasterService {
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc GetGlobalState (GetGlobalStateRequest) returns (GetGlobalStateReply);
 
-    rpc CheckShuffleReady (ShuffleReadyRequest) returns (ShuffleReadyReply);
+  rpc CheckShuffleReady (ShuffleReadyRequest) returns (ShuffleReadyReply);
 
   rpc NotifyShuffleComplete (NotifyRequest) returns (NotifyReply);
   rpc NotifyMergeComplete (NotifyRequest) returns (NotifyReply);
