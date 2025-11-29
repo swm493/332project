@@ -1,35 +1,43 @@
 package worker
 
-import io.grpc.ManagedChannelBuilder
+import io.grpc.{ManagedChannelBuilder, Server, ServerBuilder}
+
 import java.util.logging.Logger
-import services.{NodeID, WorkerState}
-import services.WorkerState._
-import sorting.common._
-import sorting.worker._
-import sorting.master._
+import scala.concurrent.ExecutionContext
+import services.WorkerState
+import services.WorkerState.*
+import sorting.common.*
+import sorting.master.*
 import services.Constant.Ports
+import sorting.worker.*
 
 /**
- * WorkerNode는 상태 관리와 전체 수명 주기를 담당합니다. (Orchestrator)
- * 구체적인 작업 로직은 WorkerPhase 구현체들에게 위임합니다.
+ * WorkerNode는 상태 관리, 서버 수명 주기(Lifecycle), 전체 흐름을 담당합니다.
+ * MasterNode와 동일한 패턴으로 리팩토링되었습니다.
  */
-class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String) {
+class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
   private val logger = Logger.getLogger(classOf[WorkerNode].getName)
 
-  private val selfIP = java.net.InetAddress.getLocalHost.getHostAddress
+  private val selfIP = services.NetworkUtils.findLocalIpAddress()
 
   private val MasterWorkerID = s"${selfIP}:${Ports.MasterWorkerPort}"
   private val WorkerWorkerID = s"${selfIP}:${Ports.WorkerWorkerPort}"
 
-  // 1. Master 연결 설정
   private val Array(host, port) = masterAddress.split(":")
   private val channel = ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build
   private val masterClient = MasterServiceGrpc.blockingStub(channel)
 
-  // 2. 컨텍스트 생성 (Phases 간 공유될 데이터 및 헬퍼)
   private val context = new WorkerContext(MasterWorkerID, WorkerWorkerID, inputDirs, outputDir, masterClient)
 
-  // 3. 상태별 실행기(Strategy) 매핑
+  private var server: Server = _
+
+  private val onDataReceived = (partitionID: Int, data: Array[Byte]) => {
+    logger.info(s"Received partition $partitionID data (${data.length} bytes)")
+    context.handleReceivedData(partitionID, data)
+  }
+
+  private val networkService = new WorkerNetworkService(WorkerWorkerID, onDataReceived)
+
   private val phases: Map[WorkerState, WorkerPhase] = Map(
     Sampling -> new SamplingPhase(),
     Shuffling -> new ShufflePhase(),
@@ -37,8 +45,25 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   )
 
   def start(): Unit = {
+    context.networkService = this.networkService
 
-    logger.info(s"Worker $MasterWorkerID starting...")
+    // [리팩토링] 서버 시작 로직이 Node로 이동
+    server = ServerBuilder.forPort(Ports.WorkerWorkerPort)
+      .addService(WorkerServiceGrpc.bindService(networkService, ec))
+      .build
+      .start()
+
+    logger.info(s"Worker server started on $WorkerWorkerID")
+    logger.info(s"Worker $MasterWorkerID connecting to Master at $masterAddress")
+
+    try {
+      runWorkerLoop()
+    } finally {
+      stop()
+    }
+  }
+
+  private def runWorkerLoop(): Unit = {
     var currentState = register()
 
     while (currentState != Done && currentState != Failed) {
@@ -52,18 +77,15 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             currentState = pollHeartbeat()
 
           case s if phases.contains(s) =>
-            // [Logic Merge] Shuffling 단계인데 Splitter 정보가 없으면 받아옴 (develop 로직)
             if (s == Shuffling && !context.isReadyForShuffle) {
               fetchGlobalState()
             }
 
-            // 데이터가 준비되었으면 로직 실행
             if (s != Shuffling || context.isReadyForShuffle) {
               val nextExpected = phases(s).execute(context)
               waitForState(nextExpected)
               currentState = nextExpected
             } else {
-              // 준비 안됐으면 대기
               Thread.sleep(1000)
               currentState = pollHeartbeat()
             }
@@ -77,12 +99,16 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
           logger.severe(s"Error in loop: ${e.getMessage}")
           e.printStackTrace()
           Thread.sleep(5000)
-          // 에러 발생 시 재등록 시도 혹은 대기
           currentState = pollHeartbeat()
       }
     }
+  }
 
-    channel.shutdown()
+  private def stop(): Unit = {
+    logger.info("Worker shutting down...")
+    if (server != null) server.shutdown()
+    if (channel != null) channel.shutdown()
+    if (networkService != null) networkService.closeChannels() // 클라이언트 채널 정리
   }
 
   private def register(): WorkerState = {
@@ -93,15 +119,11 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private def pollHeartbeat(): WorkerState = {
     val res = masterClient.heartbeat(HeartbeatRequest(MasterWorkerID))
-    // Heartbeat는 가볍게 상태만 체크, 데이터가 필요하면 fetchGlobalState 사용
-    val serverState = WorkerState.withName(res.state.name)
-    serverState
+    WorkerState.withName(res.state.name)
   }
 
-  // [New Feature from develop] 대용량 메타데이터 별도 요청
   private def fetchGlobalState(): Unit = {
     try {
-      logger.info("Fetching global state from master...")
       val res = masterClient.getGlobalState(GetGlobalStateRequest(MasterWorkerID))
       updateContextData(res.splitters, res.allWorkerIds)
     } catch {
@@ -110,7 +132,6 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   }
 
   private def waitForState(target: WorkerState): Unit = {
-    // 이미 타겟 상태거나 완료된 상태면 즉시 리턴
     var s = pollHeartbeat()
     while(s != target && s != Done && s != Failed) {
       Thread.sleep(1000)

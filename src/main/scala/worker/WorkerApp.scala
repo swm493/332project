@@ -2,6 +2,7 @@ package worker
 
 import java.io.File
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.ExecutionContext.Implicits.global
 
 /**
  * WorkerApp: 워커를 실행하는 메인 프로그램
@@ -9,7 +10,7 @@ import scala.collection.mutable.ListBuffer
  */
 object WorkerApp {
 
-  case class Config(
+  private case class Config(
                      masterAddress: String = "",
                      inputDirs: List[String] = List.empty,
                      outputDir: String = ""
@@ -40,7 +41,7 @@ object WorkerApp {
 
     try {
       var masterAddress = ""
-      var inputDirs = ListBuffer[String]()
+      val inputDirs = ListBuffer[String]()
       var outputDir = ""
 
       var i = 0

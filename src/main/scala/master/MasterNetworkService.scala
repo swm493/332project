@@ -39,9 +39,9 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     // Shuffling 단계지만 아직 Splitter가 준비되지 않았다면 Waiting 상태로 응답
     val responseState = s match {
       case Shuffling if !state.isShufflingReady =>
-        HeartbeatReply.WorkerState.Waiting
+        HeartbeatReply.WorkerHeartState.Waiting
       case _ =>
-        HeartbeatReply.WorkerState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerState.Unregistered)
+        HeartbeatReply.WorkerHeartState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerHeartState.Unregistered)
     }
 
     // Heartbeat는 가볍게 상태만 반환 (데이터 전송 최소화)
@@ -80,8 +80,35 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
   }
 
   override def notifyMergeComplete(req: NotifyRequest): Future[NotifyReply] = {
+    // 1. 상태 업데이트
     state.updateMergeStatus(req.workerId)
+
+    // [수정] 모든 워커가 작업을 완료했는지 확인
+    if (state.isAllWorkersFinished) {
+      logger.info(s"All workers have completed the job. Initiating shutdown sequence.")
+      scheduleShutdown()
+    }
+
     Future.successful(NotifyReply(ack = true))
+  }
+
+  /**
+   * [추가] 시스템 종료 헬퍼 메서드
+   * 마지막 Worker에게 응답(NotifyReply)이 전송될 시간을 확보하기 위해
+   * 별도 스레드에서 지연 후 종료합니다.
+   */
+  private def scheduleShutdown(): Unit = {
+    new Thread(() => {
+      try {
+        // gRPC 응답이 네트워크를 타고 갈 시간을 줌 (예: 1~2초)
+        Thread.sleep(2000)
+        logger.info("Master shutting down now.")
+        System.exit(0) // 프로그램 강제 종료
+      } catch {
+        case e: InterruptedException =>
+          e.printStackTrace()
+      }
+    }).start()
   }
 
   // Helper: List[Key] -> Seq[ProtoKey] 변환

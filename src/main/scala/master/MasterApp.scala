@@ -1,7 +1,7 @@
 package master
 
 import java.util.concurrent.Executors
-import scala.concurrent.ExecutionContext // *** 이 줄을 추가했습니다. ***
+import scala.concurrent.ExecutionContext
 
 /**
  * MasterApp: 마스터를 실행하는 메인 프로그램
@@ -32,11 +32,8 @@ object MasterApp {
 
     // gRPC 서버를 위한 스레드 풀
     val execContext = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(numWorkers + 1))
-
-    // 포트는 하드코딩하지 않는 것이 좋으나, 예제 편의상 8080 사용
-    val port = 1557
-
-    val masterNode = new MasterNode(execContext, port, numWorkers)
+    
+    val masterNode = new MasterNode(execContext, numWorkers)
     masterNode.start()
   }
 }

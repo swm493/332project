@@ -21,7 +21,6 @@ class SamplingPhase extends WorkerPhase {
     println("[Phase] Sampling Started")
     val samples = ListBuffer[Array[Byte]]()
 
-    // develop 로직: StorageService를 이용한 샘플 추출
     for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
       samples ++= StorageService.extractSamples(file)
     }
@@ -30,7 +29,7 @@ class SamplingPhase extends WorkerPhase {
     ctx.masterClient.submitSamples(SampleRequest(ctx.masterWorkerID, protoSamples))
 
     println(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
-    Shuffling // 다음 예상 상태
+    Shuffling
   }
 }
 
@@ -45,7 +44,7 @@ class ShufflePhase extends WorkerPhase {
     val myStartIdx = myWorkerIdx * P
     val myEndIdx = myStartIdx + P
 
-    // --- 1. 수신부 준비 ---
+    // --- 1. 수신부 준비 (파일 스트림만 준비) ---
     val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
     val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
     val outputFiles = new ListBuffer[File]()
@@ -63,32 +62,29 @@ class ShufflePhase extends WorkerPhase {
       partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
     }
 
-    // 서버 시작 (shutdown은 여기서 하지 않음!)
-    ctx.networkService = new WorkerNetworkService(
-      ctx.workerWorkerID,
-      { (pIdx, data) =>
-        if (pIdx >= myStartIdx && pIdx < myEndIdx) {
-          val stream = partitionStreams(pIdx)
-          val idxStream = partitionIndexStreams(pIdx)
-          stream.synchronized {
-            stream.write(data)
-            idxStream.writeInt(data.length)
-          }
+    // [수정] 서버를 직접 켜지 않고, Context에 핸들러를 등록합니다.
+    // WorkerNode가 이미 켜둔 서버가 데이터를 받으면 이 로직이 실행됩니다.
+    ctx.setCustomDataHandler { (pIdx, data) =>
+      if (pIdx >= myStartIdx && pIdx < myEndIdx) {
+        val stream = partitionStreams(pIdx)
+        val idxStream = partitionIndexStreams(pIdx)
+        // 여러 스레드(gRPC)에서 동시에 들어오므로 동기화 필수
+        stream.synchronized {
+          stream.write(data)
+          idxStream.writeInt(data.length)
         }
       }
-    )
-    ctx.networkService.startServer()
+    }
 
-    println("Server started. Waiting for Barrier synchronization...")
+    println("Ready to receive data. Waiting for Barrier synchronization...")
     try {
       ctx.masterClient.checkShuffleReady(
         sorting.master.ShuffleReadyRequest(workerId = ctx.masterWorkerID)
       )
-      println("Barrier Passed! All workers represent ready. Starting Batch Sending...")
+      println("Barrier Passed! Starting Batch Sending...")
     } catch {
       case e: Exception =>
         println(s"Barrier failed: ${e.getMessage}")
-      // 실패 시 처리가 필요하지만, 일단 진행하거나 재시도 로직 필요
     }
 
     try {
@@ -187,7 +183,7 @@ class ShufflePhase extends WorkerPhase {
       var globalDone = false
       while (!globalDone) {
         val hb = ctx.masterClient.heartbeat(sorting.master.HeartbeatRequest(ctx.masterWorkerID))
-        if (hb.state == sorting.master.HeartbeatReply.WorkerState.Merging) {
+        if (hb.state == sorting.master.HeartbeatReply.WorkerHeartState.Merging) {
           globalDone = true
         } else {
           Thread.sleep(100)
@@ -196,10 +192,14 @@ class ShufflePhase extends WorkerPhase {
       println("Global Shuffle Complete! Proceeding to cleanup.")
 
     } finally {
-      if (ctx.networkService != null) ctx.networkService.shutdown()
+      // 리팩토링: 서버 종료(shutdown)는 WorkerNode가 담당하므로 여기서는 하지 않음
+      // ctx.networkService.shutdown() -> 삭제됨
 
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
+
+      // 핸들러 해제 (안전장치)
+      ctx.setCustomDataHandler(null)
     }
 
     Merging
@@ -273,7 +273,7 @@ class ShufflePhase extends WorkerPhase {
 class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     println("[Phase] Merging Started")
-    
+
     val P = Constant.Size.partitionPerWorker
     val myWorkerIdx = ctx.allWorkerIDs.indexOf(ctx.workerWorkerID)
     val myStartIdx = myWorkerIdx * P
@@ -281,7 +281,7 @@ class MergePhase extends WorkerPhase {
 
     // 각 파티션별로 병합 수행
     for (pId <- myStartIdx until myEndIdx) {
-      val dataFile = new File(ctx.outputDir, s"partition_received_$pId.data")
+      val dataFile = new File(ctx.outputDir, s"partition_received_$pId")
       val indexFile = new File(ctx.outputDir, s"partition_received_$pId.index")
       val finalFile = new File(ctx.outputDir, s"partition.$pId")
 
@@ -293,7 +293,6 @@ class MergePhase extends WorkerPhase {
 
         // 2. 데이터 파일을 쪼개서 Iterator들 생성
         // (주의: RAF는 메모리를 많이 쓰지 않지만, Iterator 개수가 많으면 파일 핸들 문제 주의)
-        // 여기서는 간단히 메모리 로드 방식이나 OnDemandChunkIterator 사용
         val raf = new RandomAccessFile(dataFile, "r")
         val iterators = createChunkIterators(raf, chunkLengths)
 

@@ -1,7 +1,10 @@
 package master
 
+import services.WorkerState
+
 import java.util.logging.Logger
-import scala.collection.mutable.{ListBuffer, Map => MutableMap}
+import scala.collection.mutable
+import scala.collection.mutable.{ListBuffer, Map as MutableMap}
 
 // 프로젝트 의존성
 import services.{Key, NodeID, Constant}
@@ -18,15 +21,15 @@ class MasterState(numWorkers: Int) {
   private val logger = Logger.getLogger(classOf[MasterState].getName)
 
   // 워커 상태 및 데이터 저장소
-  private val workerStatus = MutableMap[NodeID, WorkerState]()
-  private val workerSamples = MutableMap[NodeID, List[Key]]()
+  private val workerStatus = mutable.Map[NodeID, WorkerState]()
+  private val workerSamples = mutable.Map[NodeID, List[Key]]()
 
   private val shuffleReadyWorkers = scala.collection.mutable.Set[NodeID]()
 
   // 공유 상태 (Volatile로 가시성 확보)
-  @volatile var globalSplitters: List[Key] = null
-  @volatile var allMasterWorkerIDs: List[NodeID] = List.empty
-  @volatile var allWorkerWorkerIDs: List[NodeID] = List.empty
+  @volatile private var globalSplitters: List[Key] = null
+  @volatile private var allMasterWorkerIDs: List[NodeID] = List.empty
+  @volatile private var allWorkerWorkerIDs: List[NodeID] = List.empty
 
   /**
    * 워커 등록 처리
@@ -135,6 +138,10 @@ class MasterState(numWorkers: Int) {
    * Shuffling 단계 진입 가능 여부 (Splitter 계산 완료 여부)
    */
   def isShufflingReady: Boolean = globalSplitters != null
+
+  def isAllWorkersFinished: Boolean = {
+    workerStatus.values.forall(_ == WorkerState.Done)
+  }
 
   /**
    * [Logic Merge] develop 브랜치의 실제 Splitter 계산 로직

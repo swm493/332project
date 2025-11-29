@@ -37,7 +37,7 @@ message HeartbeatRequest {
 }
 
 message HeartbeatReply {
-  enum WorkerState {
+  enum WorkerHeartState {
     Unregistered = 0;
     Sampling = 1;
     Shuffling = 2;
@@ -46,7 +46,7 @@ message HeartbeatReply {
     Failed = 5;
     Waiting = 6;
   }
-  WorkerState state = 1;
+  WorkerHeartState state = 1;
 }
 
 message GetGlobalStateRequest {

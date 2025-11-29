@@ -1,5 +1,7 @@
 package services
 
+import java.net.{InetAddress, NetworkInterface}
+import scala.jdk.CollectionConverters._
 /**
  * 프로젝트 전체에서 사용되는 공통 타입과 상태를 정의합니다.
  */
@@ -46,7 +48,6 @@ object RecordOrdering {
   }
 }
 
-// MasterNode.scala 프로토타입을 기반으로 한 워커 상태
 object WorkerState extends Enumeration {
   type WorkerState = Value
 
@@ -59,4 +60,19 @@ object WorkerState extends Enumeration {
    * Failed: 작업 중 실패 (마스터가 감지)
    */
   val Unregistered, Sampling, Shuffling, Merging, Done, Failed, Waiting = Value
+}
+
+object NetworkUtils {
+  def findLocalIpAddress(): String = {
+    try {
+      NetworkInterface.getNetworkInterfaces.asScala
+        .filter(i => !i.isLoopback && i.isUp)
+        .flatMap(_.getInetAddresses.asScala)
+        .find(addr => addr.isSiteLocalAddress)
+        .map(_.getHostAddress)
+        .getOrElse(InetAddress.getLocalHost.getHostAddress)
+    } catch {
+      case _: Exception => "Unknown-IP"
+    }
+  }
 }
