@@ -1,6 +1,6 @@
 package services
 
-import scala.collection.mutable
+import java.util.PriorityQueue
 
 object MergeService {
 
@@ -36,22 +36,22 @@ object MergeService {
 
     if (activeIterators.isEmpty) return
 
-    // 2. Min-Heap 생성 (오름차순 정렬을 위해 reverse 사용)
-    val pq = mutable.PriorityQueue.empty[(Array[Byte], Int)](RecordOrdering.reverse)
+    // 2. Java PriorityQueue 생성 (Min-Heap)
+    val pq = PriorityQueue[(Array[Byte], Int)](activeIterators.length, RecordOrdering)
 
     // 3. 초기화: 각 이터레이터에서 첫 번째 레코드를 꺼내 큐에 삽입
     for (i <- activeIterators.indices) {
       val (iter, _) = activeIterators(i)
       if (iter.hasNext) {
         // 큐에는 (데이터, activeIterators 배열 내의 인덱스)를 저장
-        pq.enqueue((iter.next(), i))
+        pq.add((iter.next(), i))
       }
     }
 
     // 4. 병합 루프
-    while (pq.nonEmpty) {
+    while (!pq.isEmpty) {
       // 가장 작은 레코드를 꺼냄
-      val (minRecord, activeIdx) = pq.dequeue()
+      val (minRecord, activeIdx) = pq.poll()
 
       // 결과 출력 (콜백 호출)
       writeOutput(minRecord)
@@ -59,7 +59,7 @@ object MergeService {
       // 해당 레코드가 나온 이터레이터에서 다음 값을 가져와 큐에 다시 넣음
       val (iter, _) = activeIterators(activeIdx)
       if (iter.hasNext) {
-        pq.enqueue((iter.next(), activeIdx))
+        pq.add((iter.next(), activeIdx))
       }
     }
   }
