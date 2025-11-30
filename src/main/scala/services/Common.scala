@@ -29,7 +29,7 @@ object Constant {
     def value: Int = 90
     def record: Int = 100
     def partitionPerWorker: Int = 10
-    def block: Int = 64 * (1024 * 1024 - 1)
+    def block: Int = 32 * (1024 * 1024 - 1)
   }
   object Sample {
     def n: Int = 1000

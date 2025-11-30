@@ -95,20 +95,29 @@ class ShufflePhase extends WorkerPhase {
 
       println("Step A: Local Sort & Indexing...")
       var chunkId = 0
+
       for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
         val recordsIter = StorageService.readRecords(file)
-        if (recordsIter.hasNext) {
-          val blockData = recordsIter.toArray
-          scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
-          val segments = findPartitionSegments(blockData, ctx)
 
-          val dataFile = new File(tempChunkDir, s"chunk_$chunkId.data")
-          val indexFile = new File(tempChunkDir, s"chunk_$chunkId.index")
+        val currentBlock = new ListBuffer[Array[Byte]]()
+        var currentSize = 0L
 
-          saveSortedBlock(blockData, dataFile)
-          saveIndex(segments, indexFile)
+        while(recordsIter.hasNext) {
+          val record = recordsIter.next()
+          currentBlock += record
+          currentSize += record.length
 
-          generatedChunks += ((dataFile, indexFile))
+          if (currentSize >= services.Constant.Size.block) {
+            processBlock(currentBlock.toArray, chunkId, ctx, tempChunkDir, generatedChunks)
+
+            currentBlock.clear()
+            currentSize = 0
+            chunkId += 1
+          }
+        }
+
+        if (currentBlock.nonEmpty) {
+          processBlock(currentBlock.toArray, chunkId, ctx, tempChunkDir, generatedChunks)
           chunkId += 1
         }
       }
@@ -194,6 +203,20 @@ class ShufflePhase extends WorkerPhase {
     }
 
     Merging
+  }
+
+  private def processBlock(blockData: Array[Array[Byte]], id: Int, ctx: WorkerContext, tempChunkDir: File, generatedChunks: ListBuffer[(File, File)]): Unit = {
+    scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
+
+    val segments = findPartitionSegments(blockData, ctx)
+
+    val dataFile = new File(tempChunkDir, s"chunk_$id.data")
+    val indexFile = new File(tempChunkDir, s"chunk_$id.index")
+
+    saveSortedBlock(blockData, dataFile)
+    saveIndex(segments, indexFile)
+
+    generatedChunks += ((dataFile, indexFile))
   }
 
   private def findPartitionSegments(sortedData: Array[Array[Byte]], ctx: WorkerContext): List[PartitionSegment] = {
