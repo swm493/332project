@@ -1,11 +1,11 @@
 package worker
 
-import services.Constant.Ports
 import sorting.master.*
-import services.{Constant, Key, NodeAddress, WorkerEndpoint, IP, Port, ID, PartitionID}
+import services.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID}
 import services.RecordOrdering.ordering.compare
 
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.{ConcurrentLinkedQueue, Executors} // Executors 추가
+import scala.concurrent.ExecutionContext
 import scala.jdk.CollectionConverters.*
 
 class WorkerContext(
@@ -15,7 +15,6 @@ class WorkerContext(
                    ) {
   private val selfIP: IP = services.NetworkUtils.findLocalIpAddress()
 
-  // [수정] selfAddress는 IP와 Port 타입을 사용
   var selfAddress: NodeAddress = NodeAddress(selfIP, 0)
 
   var myEndpoint: WorkerEndpoint = _
@@ -23,6 +22,9 @@ class WorkerContext(
   var splitters: List[Key] = _
 
   var networkService: WorkerNetworkService = _
+
+  // CPU 코어 수(4개)만큼의 스레드 풀 생성
+  val executionContext: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
 
   // 파티션 ID는 Int (PartitionID)
   @volatile private var dataHandler: (PartitionID, Array[Byte]) => Unit = _

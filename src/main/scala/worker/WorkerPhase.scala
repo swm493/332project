@@ -9,6 +9,11 @@ import com.google.protobuf.ByteString
 import java.io.*
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration.Duration
+import java.util.concurrent.ConcurrentLinkedQueue
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.jdk.CollectionConverters.*
 
 trait WorkerPhase {
   def execute(ctx: WorkerContext): WorkerState
@@ -48,7 +53,7 @@ class ShufflePhase extends WorkerPhase {
     val myStartIdx = myWorkerIdx * P
     val myEndIdx = myStartIdx + P
 
-    // --- 1. 수신부 준비 ---
+    // 1. 수신부 준비
     val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
     val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
     val outputFiles = new ListBuffer[File]()
@@ -66,6 +71,7 @@ class ShufflePhase extends WorkerPhase {
       partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
     }
 
+    // 서버 시작 (수신 콜백)
     ctx.setCustomDataHandler { (pIdx, data) =>
       if (pIdx >= myStartIdx && pIdx < myEndIdx) {
         val stream = partitionStreams(pIdx)
@@ -91,36 +97,43 @@ class ShufflePhase extends WorkerPhase {
     try {
       val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
       if (!tempChunkDir.exists()) tempChunkDir.mkdirs()
-      val generatedChunks = new ListBuffer[(File, File)]()
+      val generatedChunks = new ConcurrentLinkedQueue[(File, File)]()
 
       println("Step A: Local Sort & Indexing...")
+
+      val allInputFiles = ctx.inputDirs.flatMap(dir => StorageService.listFiles(dir))
+
       var chunkId = 0
 
-      for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
-        val recordsIter = StorageService.readRecords(file)
+      val sortFutures = allInputFiles.zipWithIndex.map { case (file, idx) =>
+        Future {
+          val recordsIter = StorageService.readRecords(file)
+          val currentBlock = new ListBuffer[Array[Byte]]()
+          var currentSize = 0L
+          var subChunkId = 0
 
-        val currentBlock = new ListBuffer[Array[Byte]]()
-        var currentSize = 0L
+          while (recordsIter.hasNext) {
+            val record = recordsIter.next()
+            currentBlock += record
+            currentSize += record.length
 
-        while(recordsIter.hasNext) {
-          val record = recordsIter.next()
-          currentBlock += record
-          currentSize += record.length
-
-          if (currentSize >= services.Constant.Size.block) {
-            processBlock(currentBlock.toArray, chunkId, ctx, tempChunkDir, generatedChunks)
-
-            currentBlock.clear()
-            currentSize = 0
-            chunkId += 1
+            if (currentSize >= services.Constant.Size.block) {
+              val uniqueId = s"${idx}_${subChunkId}"
+              processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDir, generatedChunks)
+              currentBlock.clear()
+              currentSize = 0
+              subChunkId += 1
+            }
           }
-        }
-
-        if (currentBlock.nonEmpty) {
-          processBlock(currentBlock.toArray, chunkId, ctx, tempChunkDir, generatedChunks)
-          chunkId += 1
-        }
+          if (currentBlock.nonEmpty) {
+            val uniqueId = s"${idx}_${subChunkId}"
+            processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDir, generatedChunks)
+          }
+        }(ctx.executionContext) // WorkerContext의 스레드 풀 사용
       }
+
+      Await.result(Future.sequence(sortFutures), Duration.Inf)
+      println(s"Step A Complete. Generated ${generatedChunks.size()} chunks.")
 
       println("Step B: Batch Sending...")
       val BATCH_SIZE = 1024 * 1024
@@ -137,7 +150,7 @@ class ShufflePhase extends WorkerPhase {
         }
       }
 
-      for ((dataFile, indexFile) <- generatedChunks) {
+      for ((dataFile, indexFile) <- generatedChunks.asScala) {
         val segments = loadIndex(indexFile)
         val raf = new RandomAccessFile(dataFile, "r")
         try {
@@ -171,11 +184,11 @@ class ShufflePhase extends WorkerPhase {
       }
 
       networkBuffers.keys.foreach(flushBuffer)
-      ctx.networkService.finishSending()
+      if (ctx.networkService != null) ctx.networkService.finishSending()
 
       println("Sending complete. Deleting temporary chunks...")
 
-      generatedChunks.foreach { case (dataFile, indexFile) =>
+      generatedChunks.asScala.foreach { case (dataFile, indexFile) =>
         if (dataFile.exists()) dataFile.delete()
         if (indexFile.exists()) indexFile.delete()
       }
@@ -205,7 +218,7 @@ class ShufflePhase extends WorkerPhase {
     Merging
   }
 
-  private def processBlock(blockData: Array[Array[Byte]], id: Int, ctx: WorkerContext, tempChunkDir: File, generatedChunks: ListBuffer[(File, File)]): Unit = {
+  private def processBlock(blockData: Array[Array[Byte]], id: String, ctx: WorkerContext, tempChunkDir: File, generatedChunks: java.util.Queue[(File, File)]): Unit = {
     scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
 
     val segments = findPartitionSegments(blockData, ctx)
@@ -216,7 +229,7 @@ class ShufflePhase extends WorkerPhase {
     saveSortedBlock(blockData, dataFile)
     saveIndex(segments, indexFile)
 
-    generatedChunks += ((dataFile, indexFile))
+    generatedChunks.add((dataFile, indexFile))
   }
 
   private def findPartitionSegments(sortedData: Array[Array[Byte]], ctx: WorkerContext): List[PartitionSegment] = {
@@ -278,36 +291,42 @@ class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     println("[Phase] Merging Started")
 
+    if (ctx.networkService != null) ctx.networkService.closeChannels()
+
     val P = Constant.Size.partitionPerWorker
     val myWorkerIdx = ctx.allWorkerEndpoints.indexOf(ctx.myEndpoint)
     val myStartIdx = myWorkerIdx * P
     val myEndIdx = myStartIdx + P
 
-    for (pId <- myStartIdx until myEndIdx) {
-      val dataFile = new File(ctx.outputDir, s"partition_received_$pId")
-      val indexFile = new File(ctx.outputDir, s"partition_received_$pId.index")
-      val finalFile = new File(ctx.outputDir, s"partition.$pId")
+    val mergeFutures = (myStartIdx until myEndIdx).map { pId =>
+      Future {
+        val dataFile = new File(ctx.outputDir, s"partition_received_$pId")
+        val indexFile = new File(ctx.outputDir, s"partition_received_$pId.index")
+        val finalFile = new File(ctx.outputDir, s"partition.$pId")
 
-      if (dataFile.exists() && indexFile.exists()) {
-        println(s"Merging partition $pId...")
-        val chunkLengths = loadChunkLengths(indexFile)
-        val raf = new RandomAccessFile(dataFile, "r")
-        val iterators = createChunkIterators(raf, chunkLengths)
+        if (dataFile.exists() && indexFile.exists()) {
+          // println(s"Merging partition $pId...")
+          val chunkLengths = loadChunkLengths(indexFile)
+          val raf = new RandomAccessFile(dataFile, "r")
+          val iterators = createChunkIterators(raf, chunkLengths)
 
-        val bos = new BufferedOutputStream(new FileOutputStream(finalFile))
-        try {
-          services.MergeService.merge(
-            iterators,
-            record => bos.write(record)
-          )
-        } finally {
-          bos.close()
-          raf.close()
+          val bos = new BufferedOutputStream(new FileOutputStream(finalFile))
+          try {
+            services.MergeService.merge(
+              iterators,
+              record => bos.write(record)
+            )
+          } finally {
+            bos.close()
+            raf.close()
+          }
+        } else {
+          new FileOutputStream(finalFile).close()
         }
-      } else {
-        new FileOutputStream(finalFile).close()
-      }
+      }(ctx.executionContext) // 스레드 풀 사용
     }
+
+    Await.result(Future.sequence(mergeFutures), Duration.Inf)
 
     ctx.masterClient.notifyMergeComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
     println("[Phase] Merging Done.")
