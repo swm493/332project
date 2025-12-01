@@ -7,7 +7,6 @@ import sorting.common.ProtoKey
 import com.google.protobuf.ByteString
 
 import java.io.*
-import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.Duration
@@ -136,19 +135,6 @@ class ShufflePhase extends WorkerPhase {
       println(s"Step A Complete. Generated ${generatedChunks.size()} chunks.")
 
       println("Step B: Batch Sending...")
-      val BATCH_SIZE = 1024 * 1024
-      val networkBuffers = mutable.Map[(NodeAddress, PartitionID), ByteArrayOutputStream]()
-
-      def flushBuffer(key: (NodeAddress, PartitionID)): Unit = {
-        val (targetAddr, pId) = key
-        if (networkBuffers.contains(key)) {
-          val buf = networkBuffers(key)
-          if (buf.size() > 0) {
-            ctx.networkService.sendData(targetAddr, pId, buf.toByteArray)
-            buf.reset()
-          }
-        }
-      }
 
       for ((dataFile, indexFile) <- generatedChunks.asScala) {
         val segments = loadIndex(indexFile)
@@ -171,10 +157,7 @@ class ShufflePhase extends WorkerPhase {
                   idxStream.writeInt(chunkBytes.length)
                 }
               } else {
-                val bufferKey = (targetEndpoint.address, seg.partitionId)
-                val buf = networkBuffers.getOrElseUpdate(bufferKey, new ByteArrayOutputStream(BATCH_SIZE * 2))
-                buf.write(chunkBytes)
-                if (buf.size() >= BATCH_SIZE) flushBuffer(bufferKey)
+                ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
               }
             }
           }
@@ -183,7 +166,6 @@ class ShufflePhase extends WorkerPhase {
         }
       }
 
-      networkBuffers.keys.foreach(flushBuffer)
       if (ctx.networkService != null) ctx.networkService.finishSending()
 
       println("Sending complete. Deleting temporary chunks...")
