@@ -24,7 +24,9 @@ class WorkerContext(
   var networkService: WorkerNetworkService = _
 
   // CPU 코어 수(4개)만큼의 스레드 풀 생성
-  val executionContext: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
+  private val executorService = java.util.concurrent.Executors.newFixedThreadPool(4)
+  val executionContext: scala.concurrent.ExecutionContext =
+    scala.concurrent.ExecutionContext.fromExecutorService(executorService)
 
   // 파티션 ID는 Int (PartitionID)
   @volatile private var dataHandler: (PartitionID, Array[Byte]) => Unit = _
@@ -70,5 +72,9 @@ class WorkerContext(
       else left = mid + 1
     }
     left
+  }
+
+  def shutdown(): Unit = {
+    executorService.shutdown()
   }
 }

@@ -110,6 +110,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private def stop(): Unit = {
     logger.info("Worker shutting down...")
+    if (context != null) context.shutdown()
     if (server != null) server.shutdown()
     if (channel != null) channel.shutdown()
     if (networkService != null) networkService.closeChannels()
