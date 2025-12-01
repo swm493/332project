@@ -27,6 +27,7 @@ class MasterState(numWorkers: Int) {
   private val ipToId = mutable.Map[IP, ID]()
 
   private val shuffleReadyWorkers = scala.collection.mutable.Set[ID]()
+  private val completedShuffleWorkers = scala.collection.mutable.Set[ID]()
 
   @volatile private var globalSplitters: List[Key] = _
   private val allWorkerEndpoints = new ArrayBuffer[WorkerEndpoint](numWorkers)
@@ -119,8 +120,22 @@ class MasterState(numWorkers: Int) {
 
   def updateShuffleStatus(workerId: ID): Boolean = synchronized {
     if (!isValidWorker(workerId)) return false
-    workerStatus(workerId) = Merging
-    workerStatus.forall(_ == Merging)
+
+    completedShuffleWorkers.add(workerId)
+    logger.info(s"Worker $workerId finished shuffling. (${completedShuffleWorkers.size}/$numWorkers)")
+
+    if (completedShuffleWorkers.size == numWorkers) {
+      logger.info("All workers finished shuffling. Moving cluster to MERGING phase.")
+
+      for (id <- workerStatus.indices) {
+        if (workerStatus(id) != Failed) {
+          workerStatus(id) = Merging
+        }
+      }
+      true
+    } else {
+      false
+    }
   }
 
   def updateMergeStatus(workerId: ID): Boolean = synchronized {
