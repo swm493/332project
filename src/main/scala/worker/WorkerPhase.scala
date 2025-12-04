@@ -1,6 +1,6 @@
 package worker
 
-import utils.{Constant, NetworkUtils, NodeAddress, PartitionID, FileUtils}
+import utils.{Constant, FileUtils, Logging, NetworkUtils, PartitionID}
 import utils.WorkerState.*
 import sorting.master.{NotifyRequest, SampleRequest}
 import sorting.common.ProtoKey
@@ -12,7 +12,6 @@ import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.Duration
 import java.util.concurrent.ConcurrentLinkedQueue
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.jdk.CollectionConverters.*
 
 trait WorkerPhase {
   def execute(ctx: WorkerContext): WorkerState
@@ -22,7 +21,7 @@ case class PartitionSegment(partitionId: PartitionID, offset: Long, length: Int)
 
 class SamplingPhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
-    println("[Phase] Sampling Started")
+    Logging.logInfo("[Phase] Sampling Started")
     val samples = ListBuffer[Array[Byte]]()
 
     for (dir <- ctx.inputDirs; file <- FileUtils.listFiles(dir)) {
@@ -36,175 +35,71 @@ class SamplingPhase extends WorkerPhase {
       samples = protoSamples
     ))
 
-    println(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
-    Shuffling
+    Logging.logInfo(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
+    // Partitioning 단계로 넘어갑니다.
+    Partitioning
   }
 }
 
-class ShufflePhase extends WorkerPhase {
+class PartitioningPhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
-    println("[Phase] Shuffling Started")
+    Logging.logInfo("[Phase] Partitioning Started (Local Sort & Spill)")
 
-    val P = Constant.Size.partitionPerWorker
-    val totalPartitions = ctx.allWorkerEndpoints.length * P
-
-    val myWorkerIdx = ctx.allWorkerEndpoints.indexOf(ctx.myEndpoint)
-    val myStartIdx = myWorkerIdx * P
-    val myEndIdx = myStartIdx + P
-
-    // 1. 수신부 준비
-    val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
-    val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
-    val outputFiles = new ListBuffer[File]()
-
-    println(s"Initializing partition files ($myStartIdx ~ ${myEndIdx - 1})...")
-    for (i <- myStartIdx until myEndIdx) {
-      val fData = new File(ctx.outputDir, s"partition_received_$i")
-      val fIndex = new File(ctx.outputDir, s"partition_received_$i.index")
-      if (fData.exists()) fData.delete()
-      if (fIndex.exists()) fIndex.delete()
-
-      outputFiles += fData
-      outputFiles += fIndex
-      partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(fData, true))
-      partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
+    val tempChunkDirFile = new File(ctx.outputDir, "temp_chunks")
+    if (!tempChunkDirFile.exists()) tempChunkDirFile.mkdirs()
+    else {
+      FileUtils.listFiles(tempChunkDirFile.getAbsolutePath).foreach(_.delete())
     }
+    val tempChunkDir = tempChunkDirFile.getAbsolutePath
 
-    // 서버 시작 (수신 콜백)
-    ctx.setCustomDataHandler { (pIdx, data) =>
-      if (pIdx >= myStartIdx && pIdx < myEndIdx) {
-        val stream = partitionStreams(pIdx)
-        val idxStream = partitionIndexStreams(pIdx)
-        stream.synchronized {
-          stream.write(data)
-          idxStream.writeInt(data.length)
-        }
-      }
-    }
+    val generatedChunks = new ConcurrentLinkedQueue[(File, File)]()
+    val allInputFiles = ctx.inputDirs.flatMap(dir => FileUtils.listFiles(dir))
 
-    println("Ready to receive data. Waiting for Barrier synchronization...")
-    try {
-      ctx.masterClient.checkShuffleReady(
-        sorting.master.ShuffleReadyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint)))
-      )
-      println("Barrier Passed! Starting Batch Sending...")
-    } catch {
-      case e: Exception =>
-        println(s"Barrier failed: ${e.getMessage}")
-    }
+    // 병렬 처리: 파일을 읽어 정렬 후 디스크에 저장 (Spill)
+    val partitionFutures = allInputFiles.zipWithIndex.map { case (file, idx) =>
+      Future {
+        val recordsIter = FileUtils.readRecords(file)
+        val currentBlock = new ListBuffer[Array[Byte]]()
+        var currentSize = 0L
+        var subChunkId = 0
 
-    try {
-      val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
-      if (!tempChunkDir.exists()) tempChunkDir.mkdirs()
-      val generatedChunks = new ConcurrentLinkedQueue[(File, File)]()
+        while (recordsIter.hasNext) {
+          val record = recordsIter.next()
+          currentBlock += record
+          currentSize += record.length
 
-      println("Step A: Local Sort & Indexing...")
-
-      val allInputFiles = ctx.inputDirs.flatMap(dir => FileUtils.listFiles(dir))
-
-      var chunkId = 0
-
-      val sortFutures = allInputFiles.zipWithIndex.map { case (file, idx) =>
-        Future {
-          val recordsIter = FileUtils.readRecords(file)
-          val currentBlock = new ListBuffer[Array[Byte]]()
-          var currentSize = 0L
-          var subChunkId = 0
-
-          while (recordsIter.hasNext) {
-            val record = recordsIter.next()
-            currentBlock += record
-            currentSize += record.length
-
-            if (currentSize >= utils.Constant.Size.block) {
-              val uniqueId = s"${idx}_${subChunkId}"
-              processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDir, generatedChunks)
-              currentBlock.clear()
-              currentSize = 0
-              subChunkId += 1
-            }
-          }
-          if (currentBlock.nonEmpty) {
+          // Block 크기만큼 모이면 처리
+          if (currentSize >= utils.Constant.Size.block) {
             val uniqueId = s"${idx}_${subChunkId}"
-            processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDir, generatedChunks)
+            processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDirFile, generatedChunks)
+            currentBlock.clear()
+            currentSize = 0
+            subChunkId += 1
           }
-        }(ctx.executionContext) // WorkerContext의 스레드 풀 사용
-      }
-
-      Await.result(Future.sequence(sortFutures), Duration.Inf)
-      println(s"Step A Complete. Generated ${generatedChunks.size()} chunks.")
-
-      println("Step B: Batch Sending...")
-
-      for ((dataFile, indexFile) <- generatedChunks.asScala) {
-        val segments = loadIndex(indexFile)
-        val raf = new RandomAccessFile(dataFile, "r")
-        try {
-          for (seg <- segments) {
-            val targetWorkerIdx = seg.partitionId / P
-
-            if (targetWorkerIdx < ctx.allWorkerEndpoints.length) {
-              val targetEndpoint = ctx.allWorkerEndpoints(targetWorkerIdx)
-              val chunkBytes = new Array[Byte](seg.length)
-              raf.seek(seg.offset)
-              raf.readFully(chunkBytes)
-
-              if (targetEndpoint == ctx.myEndpoint) {
-                val stream = partitionStreams(seg.partitionId)
-                val idxStream = partitionIndexStreams(seg.partitionId)
-                stream.synchronized {
-                  stream.write(chunkBytes)
-                  idxStream.writeInt(chunkBytes.length)
-                }
-              } else {
-                ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
-              }
-            }
-          }
-        } finally {
-          raf.close()
         }
-      }
-
-      if (ctx.networkService != null) ctx.networkService.finishSending()
-
-      println("Sending complete. Deleting temporary chunks...")
-
-      generatedChunks.asScala.foreach { case (dataFile, indexFile) =>
-        if (dataFile.exists()) dataFile.delete()
-        if (indexFile.exists()) indexFile.delete()
-      }
-      if (tempChunkDir.exists()) tempChunkDir.delete()
-
-      println("Notifying Master and waiting for Global Sync...")
-
-      ctx.masterClient.notifyShuffleComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
-
-      var globalDone = false
-      while (!globalDone) {
-        val hb = ctx.masterClient.heartbeat(sorting.master.HeartbeatRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
-        if (hb.state == sorting.master.HeartbeatReply.WorkerHeartState.Merging) {
-          globalDone = true
-        } else {
-          Thread.sleep(100)
+        // 남은 데이터 처리
+        if (currentBlock.nonEmpty) {
+          val uniqueId = s"${idx}_${subChunkId}"
+          processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDirFile, generatedChunks)
         }
-      }
-      println("Global Shuffle Complete! Proceeding to cleanup.")
-
-    } finally {
-      for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
-      for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
-      ctx.setCustomDataHandler(null)
+      }(ctx.executionContext)
     }
 
-    Merging
+    Await.result(Future.sequence(partitionFutures), Duration.Inf)
+    Logging.logInfo(s"[Phase] Partitioning Complete. Generated ${generatedChunks.size()} chunks.")
+
+    // Shuffling 단계로 넘어갑니다.
+    Shuffling
   }
 
   private def processBlock(blockData: Array[Array[Byte]], id: String, ctx: WorkerContext, tempChunkDir: File, generatedChunks: java.util.Queue[(File, File)]): Unit = {
+    // 1. 로컬 정렬
     scala.util.Sorting.quickSort(blockData)(utils.RecordOrdering.ordering)
 
+    // 2. 파티션 구간 찾기
     val segments = findPartitionSegments(blockData, ctx)
 
+    // 3. 파일로 저장
     val dataFile = new File(tempChunkDir, s"chunk_$id.data")
     val indexFile = new File(tempChunkDir, s"chunk_$id.index")
 
@@ -255,6 +150,139 @@ class ShufflePhase extends WorkerPhase {
       }
     } finally { dos.close() }
   }
+}
+
+class ShufflePhase extends WorkerPhase {
+  override def execute(ctx: WorkerContext): WorkerState = {
+    Logging.logInfo("[Phase] Shuffling Started (Network Transfer)")
+
+    val P = Constant.Size.partitionPerWorker
+    val totalPartitions = ctx.allWorkerEndpoints.length * P
+
+    val myWorkerIdx = ctx.allWorkerEndpoints.indexOf(ctx.myEndpoint)
+    val myStartIdx = myWorkerIdx * P
+    val myEndIdx = myStartIdx + P
+
+    // 1. 수신부 준비 (Receive Files)
+    val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
+    val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
+    val outputFiles = new ListBuffer[File]()
+
+    Logging.logInfo(s"Initializing partition files ($myStartIdx ~ ${myEndIdx - 1})...")
+    for (i <- myStartIdx until myEndIdx) {
+      val fData = new File(ctx.outputDir, s"partition_received_$i")
+      val fIndex = new File(ctx.outputDir, s"partition_received_$i.index")
+      if (fData.exists()) fData.delete()
+      if (fIndex.exists()) fIndex.delete()
+
+      outputFiles += fData
+      outputFiles += fIndex
+      partitionStreams(i) = new BufferedOutputStream(new FileOutputStream(fData, true))
+      partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
+    }
+
+    // 2. 수신 핸들러 등록
+    ctx.setCustomDataHandler { (pIdx, data) =>
+      if (pIdx >= myStartIdx && pIdx < myEndIdx) {
+        val stream = partitionStreams(pIdx)
+        val idxStream = partitionIndexStreams(pIdx)
+        stream.synchronized {
+          stream.write(data)
+          idxStream.writeInt(data.length)
+        }
+      }
+    }
+
+    // 3. 배리어 동기화 (모든 워커가 받을 준비가 될 때까지 대기)
+    Logging.logInfo("Ready to receive data. Waiting for Barrier synchronization...")
+    try {
+      ctx.masterClient.checkShuffleReady(
+        sorting.master.ShuffleReadyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint)))
+      )
+      Logging.logInfo("Barrier Passed! Starting Batch Sending...")
+    } catch {
+      case e: Exception =>
+        Logging.logInfo(s"Barrier failed: ${e.getMessage}")
+    }
+
+    // 4. 데이터 전송 (Batch Sending)
+    try {
+      val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
+      val chunkFiles = if (tempChunkDir.exists()) {
+        FileUtils.listFiles(tempChunkDir.getAbsolutePath).filter(_.getName.endsWith(".index")).map { indexFile =>
+          val dataFile = new File(indexFile.getAbsolutePath.replace(".index", ".data"))
+          (dataFile, indexFile)
+        }
+      } else Seq.empty
+
+      for ((dataFile, indexFile) <- chunkFiles) {
+        val segments = loadIndex(indexFile)
+        val raf = new RandomAccessFile(dataFile, "r")
+        try {
+          for (seg <- segments) {
+            val targetWorkerIdx = seg.partitionId / P
+
+            if (targetWorkerIdx < ctx.allWorkerEndpoints.length) {
+              val targetEndpoint = ctx.allWorkerEndpoints(targetWorkerIdx)
+              // 해당 세그먼트 데이터 읽기
+              val chunkBytes = new Array[Byte](seg.length)
+              raf.seek(seg.offset)
+              raf.readFully(chunkBytes)
+
+              if (targetEndpoint == ctx.myEndpoint) {
+                // 자기 자신에게 보내는 경우 (직접 쓰기)
+                val stream = partitionStreams(seg.partitionId)
+                val idxStream = partitionIndexStreams(seg.partitionId)
+                stream.synchronized {
+                  stream.write(chunkBytes)
+                  idxStream.writeInt(chunkBytes.length)
+                }
+              } else {
+                // 다른 워커에게 전송
+                ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
+              }
+            }
+          }
+        } finally {
+          raf.close()
+        }
+      }
+
+      if (ctx.networkService != null) ctx.networkService.finishSending()
+
+      Logging.logInfo("Sending complete. Deleting temporary chunks...")
+
+      // 임시 파일 정리
+      chunkFiles.foreach { case (dataFile, indexFile) =>
+        if (dataFile.exists()) dataFile.delete()
+        if (indexFile.exists()) indexFile.delete()
+      }
+      if (tempChunkDir.exists()) tempChunkDir.delete()
+
+      // 5. 완료 알림 및 글로벌 동기화
+      Logging.logInfo("Notifying Master and waiting for Global Sync...")
+
+      ctx.masterClient.notifyShuffleComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
+
+      var globalDone = false
+      while (!globalDone) {
+        val hb = ctx.masterClient.heartbeat(sorting.master.HeartbeatRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
+        if (hb.state == sorting.master.HeartbeatReply.WorkerHeartState.Merging) {
+          globalDone = true
+        } else {
+          Thread.sleep(100)
+        }
+      }
+      Logging.logInfo("Global Shuffle Complete! Proceeding to cleanup.")
+
+    } finally {
+      for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
+      for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
+      ctx.setCustomDataHandler(null)
+    }
+
+    Merging
+  }
 
   private def loadIndex(file: File): List[PartitionSegment] = {
     val dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))
@@ -271,7 +299,7 @@ class ShufflePhase extends WorkerPhase {
 
 class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
-    println("[Phase] Merging Started")
+    Logging.logInfo("[Phase] Merging Started")
 
     if (ctx.networkService != null) ctx.networkService.closeChannels()
 
@@ -287,7 +315,6 @@ class MergePhase extends WorkerPhase {
         val finalFile = new File(ctx.outputDir, s"partition.$pId")
 
         if (dataFile.exists() && indexFile.exists()) {
-          // println(s"Merging partition $pId...")
           val chunkLengths = loadChunkLengths(indexFile)
           val raf = new RandomAccessFile(dataFile, "r")
           val iterators = createChunkIterators(raf, chunkLengths)
@@ -305,13 +332,13 @@ class MergePhase extends WorkerPhase {
         } else {
           new FileOutputStream(finalFile).close()
         }
-      }(ctx.executionContext) // 스레드 풀 사용
+      }(ctx.executionContext)
     }
 
     Await.result(Future.sequence(mergeFutures), Duration.Inf)
 
     ctx.masterClient.notifyMergeComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
-    println("[Phase] Merging Done.")
+    Logging.logInfo("[Phase] Merging Done.")
     Done
   }
 

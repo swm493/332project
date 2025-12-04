@@ -32,7 +32,7 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
 
     val s = state.getWorkerStatus(workerId)
     val responseState = s match {
-      case Shuffling if !state.isShufflingReady => HeartbeatReply.WorkerHeartState.Waiting
+      case Partitioning | Shuffling if !state.isShufflingReady => HeartbeatReply.WorkerHeartState.Waiting
       case _ => HeartbeatReply.WorkerHeartState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerHeartState.Unregistered)
     }
     Future.successful(HeartbeatReply(state = responseState))
@@ -48,6 +48,7 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
 
   override def checkShuffleReady(req: ShuffleReadyRequest): Future[ShuffleReadyReply] = {
     val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
+    // 이 요청이 오면 MasterState 내부에서 해당 워커 상태를 Shuffling으로 업데이트함
     val isSuccess = if (workerId != -1) state.waitForShuffleReady(workerId) else false
     Future.successful(ShuffleReadyReply(allReady = isSuccess))
   }

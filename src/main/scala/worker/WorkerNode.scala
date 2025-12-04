@@ -27,6 +27,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private val phases: Map[WorkerState, WorkerPhase] = Map(
     Sampling -> new SamplingPhase(),
+    Partitioning -> new PartitioningPhase(),
     Shuffling -> new ShufflePhase(),
     Merging -> new MergePhase()
   )
@@ -65,6 +66,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       }
     }
 
+    // 2. 메인 상태 머신 루프
     while (currentState != Done && currentState != Failed) {
       try {
         currentState match {
@@ -76,11 +78,25 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             currentState = pollHeartbeat()
 
           case s if phases.contains(s) =>
-            if (s == Shuffling && !context.isReadyForShuffle) {
+            // [Partitioning] 시작 전 Splitter 정보가 없으면 Master에서 받아옴
+            if (s == Partitioning && context.splitters.isEmpty) {
+              Logging.logInfo("Fetching global state for splitters...")
               fetchGlobalState()
             }
 
-            if (s != Shuffling || context.isReadyForShuffle) {
+            // [Shuffling] 시작 전 전체 Worker Endpoint 정보가 없으면 Master에서 받아옴
+            if (s == Shuffling && !context.isReadyForShuffle) {
+              Logging.logInfo("Fetching global state for shuffle peers...")
+              fetchGlobalState()
+            }
+
+            val canExecute = s match {
+              case Partitioning => context.splitters.nonEmpty
+              case Shuffling => context.isReadyForShuffle
+              case _ => true
+            }
+
+            if (canExecute) {
               val nextExpected = phases(s).execute(context)
               waitForState(nextExpected)
               currentState = nextExpected
@@ -92,6 +108,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
           case _ =>
             Logging.logWarning(s"Unknown state: $currentState")
             Thread.sleep(1000)
+            currentState = pollHeartbeat()
         }
       } catch {
         case e: Exception =>
@@ -118,8 +135,8 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     val res = masterClient.registerWorker(req)
 
     if (res.workerEndpoint.isDefined) {
-      context.myEndpoint = toDomain(res.workerEndpoint.get)
-      Logging.logInfo(s"Registered as Worker ID ${context.myEndpoint.id}")
+      context.myEndpoint = NetworkUtils.workerProtoToEndpoint(res.workerEndpoint.get)
+      Logging.logEssential(s"Registered as Worker ID ${context.myEndpoint.id}")
     }
 
     updateContextData(res.splitters, res.allWorkerEndpoints)
@@ -145,7 +162,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   private def waitForState(target: WorkerState): Unit = {
     var s = pollHeartbeat()
     while(s != target && s != Done && s != Failed) {
-      Thread.sleep(1000)
+      Thread.sleep(500)
       s = pollHeartbeat()
     }
   }
@@ -155,12 +172,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       context.splitters = splitters.map(_.key.toByteArray).toList
     }
     if (endpoints.nonEmpty) {
-      context.allWorkerEndpoints = endpoints.map(toDomain).toList
+      context.allWorkerEndpoints = endpoints.map(NetworkUtils.workerProtoToEndpoint).toList
     }
-  }
-
-  private def toDomain(proto: sorting.common.WorkerEndpoint): utils.WorkerEndpoint = {
-    val addr = proto.address.get
-    utils.WorkerEndpoint(proto.id.toInt, utils.NodeAddress(addr.ip, addr.port))
   }
 }

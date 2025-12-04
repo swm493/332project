@@ -2,9 +2,8 @@ package master
 
 import utils.{Logging, WorkerState}
 
-import java.util.logging.Logger
 import scala.collection.mutable
-import scala.collection.mutable.{ArrayBuffer, ListBuffer, Map as MutableMap}
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 
 // 프로젝트 의존성
 import utils.{Key, WorkerEndpoint, NodeAddress, Constant, ID, IP}
@@ -60,7 +59,13 @@ class MasterState(numWorkers: Int) {
     // 3. 상태 결정 (Recovery Logic)
     val assignedState = if (globalSplitters != null) {
       val savedState = workerStatus(workerId)
-      if (savedState.id >= Merging.id) savedState else Shuffling
+
+      if (savedState.id >= Merging.id) savedState
+      else if (savedState.id >= Shuffling.id) Shuffling
+      else {
+        workerStatus(workerId) = Partitioning
+        Partitioning
+      }
     } else {
       workerStatus(workerId) = Sampling
       Sampling
@@ -68,7 +73,7 @@ class MasterState(numWorkers: Int) {
 
     Logging.logInfo(s"Worker $workerId (${workerAddress.ip}) registered/recovered. State: $assignedState. Workers: ${ipToId.size}/$numWorkers")
 
-    val splittersToSend = if (assignedState.id >= Shuffling.id) globalSplitters else null
+    val splittersToSend = if (assignedState.id >= Partitioning.id) globalSplitters else null
 
     (assignedState, splittersToSend, myEndpoint, allWorkerEndpoints.toList)
   }
@@ -77,7 +82,7 @@ class MasterState(numWorkers: Int) {
     if (!isValidWorker(workerId)) return false
 
     workerSamples(workerId) = Some(samples)
-    workerStatus(workerId) = Shuffling
+    workerStatus(workerId) = Partitioning
 
     val receivedCount = workerSamples.count(_.isDefined)
     if (receivedCount == numWorkers) {
@@ -91,8 +96,10 @@ class MasterState(numWorkers: Int) {
   def waitForShuffleReady(workerId: ID): Boolean = synchronized {
     if (!isValidWorker(workerId)) return false
 
+    workerStatus(workerId) = Shuffling
     shuffleReadyWorkers.add(workerId)
-    Logging.logInfo(s"Worker $workerId ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
+
+    Logging.logInfo(s"Worker $workerId finished partitioning & ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
 
     if (shuffleReadyWorkers.size == numWorkers) {
       Logging.logInfo("Barrier Reached! Releasing all workers...")
