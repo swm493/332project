@@ -1,8 +1,8 @@
 package worker
 
 import sorting.master.*
-import services.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID}
-import services.RecordOrdering.ordering.compare
+import utils.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID}
+import utils.RecordOrdering.ordering.compare
 
 import java.util.concurrent.{ConcurrentLinkedQueue, Executors} // Executors 추가
 import scala.concurrent.ExecutionContext
@@ -13,7 +13,7 @@ class WorkerContext(
                      val outputDir: String,
                      val masterClient: MasterServiceGrpc.MasterServiceBlockingStub
                    ) {
-  private val selfIP: IP = services.NetworkUtils.findLocalIpAddress()
+  private val selfIP: IP = utils.NetworkUtils.findLocalIpAddress()
 
   var selfAddress: NodeAddress = NodeAddress(selfIP, 0)
 

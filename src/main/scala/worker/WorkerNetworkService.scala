@@ -2,17 +2,16 @@ package worker
 
 import io.grpc.{ManagedChannel, ManagedChannelBuilder}
 import io.grpc.stub.StreamObserver
-import sorting.worker._
+import sorting.worker.*
+
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
-import java.util.logging.Logger
 import com.google.protobuf.ByteString
+
 import scala.concurrent.ExecutionContext
-import services.{NodeAddress, PartitionID}
+import utils.{Logging, NodeAddress, PartitionID}
 
 class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(implicit ec: ExecutionContext)
   extends WorkerServiceGrpc.WorkerService {
-
-  private val logger = Logger.getLogger(classOf[WorkerNetworkService].getName)
 
   // --- Server Side ---
 
@@ -23,7 +22,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
       }
 
       override def onError(t: Throwable): Unit = {
-        logger.warning(s"[WorkerNetwork] Receive error from peer: ${t.getMessage}")
+        Logging.logWarning(s"[WorkerNetwork] Receive error from peer: ${t.getMessage}")
       }
 
       override def onCompleted(): Unit = {
@@ -52,7 +51,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
         sent = true
       } catch {
         case e: Exception =>
-          logger.warning(s"Send failed to $targetAddress (attempt ${retryCount+1}): ${e.getMessage}")
+          Logging.logWarning(s"Send failed to $targetAddress (attempt ${retryCount+1}): ${e.getMessage}")
           sendObservers.remove(targetAddress)
           retryCount += 1
           try { Thread.sleep(500) } catch { case _: InterruptedException => }
@@ -60,7 +59,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
     }
 
     if (!sent) {
-      logger.severe(s"Failed to send data to $targetAddress after $maxRetries attempts. Data lost?")
+      Logging.logSevere(s"Failed to send data to $targetAddress after $maxRetries attempts. Data lost?")
     }
   }
 
@@ -74,7 +73,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
       stub.shuffle(new StreamObserver[ShuffleReply] {
         override def onNext(value: ShuffleReply): Unit = {}
         override def onError(t: Throwable): Unit = {
-          logger.warning(s"Error in send stream to $addr: ${t.getMessage}")
+          Logging.logWarning(s"Error in send stream to $addr: ${t.getMessage}")
           sendObservers.remove(addr)
         }
         override def onCompleted(): Unit = {}
@@ -86,7 +85,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
     val it = sendObservers.values().iterator()
     while (it.hasNext) {
       try { it.next().onCompleted() }
-      catch { case e: Exception => logger.warning(s"Error completing observer: ${e.getMessage}") }
+      catch { case e: Exception => Logging.logWarning(s"Error completing observer: ${e.getMessage}") }
     }
     sendObservers.clear()
   }
@@ -96,9 +95,9 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
     val it = channels.values().iterator()
     while (it.hasNext) {
       try { it.next().shutdown().awaitTermination(1, TimeUnit.SECONDS) }
-      catch { case e: Exception => logger.warning(s"Error shutting down channel: ${e.getMessage}") }
+      catch { case e: Exception => Logging.logWarning(s"Error shutting down channel: ${e.getMessage}") }
     }
     channels.clear()
-    logger.info("WorkerNetworkService client channels closed.")
+    Logging.logInfo("WorkerNetworkService client channels closed.")
   }
 }

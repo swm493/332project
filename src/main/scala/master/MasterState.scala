@@ -1,29 +1,25 @@
 package master
 
-import services.WorkerState
+import utils.{Logging, WorkerState}
+
 import java.util.logging.Logger
 import scala.collection.mutable
-import scala.collection.mutable.{ListBuffer, ArrayBuffer, Map as MutableMap}
+import scala.collection.mutable.{ArrayBuffer, ListBuffer, Map as MutableMap}
 
 // 프로젝트 의존성
-import services.{Key, WorkerEndpoint, NodeAddress, Constant, ID, IP}
-import services.WorkerState._
-import services.RecordOrdering.ordering
+import utils.{Key, WorkerEndpoint, NodeAddress, Constant, ID, IP}
+import utils.WorkerState._
+import utils.RecordOrdering.ordering
 
 /**
  * Master의 상태 데이터와 비즈니스 로직을 관리하는 클래스입니다.
  * ID, IP 등의 타입 별칭을 적용하여 가독성을 높였습니다.
  */
 class MasterState(numWorkers: Int) {
-  private val logger = Logger.getLogger(classOf[MasterState].getName)
-
-  // workerStatus(id) : 해당 ID 워커의 상태
   private val workerStatus = new ArrayBuffer[WorkerState](numWorkers)
 
-  // workerSamples(id) : 해당 ID 워커의 샘플
   private val workerSamples = new ArrayBuffer[Option[List[Key]]](numWorkers)
 
-  // 식별자 맵: IP -> Worker ID
   private val ipToId = mutable.Map[IP, ID]()
 
   private val shuffleReadyWorkers = scala.collection.mutable.Set[ID]()
@@ -36,9 +32,7 @@ class MasterState(numWorkers: Int) {
    * 워커 등록 처리
    */
   def registerWorker(workerAddress: NodeAddress): (WorkerState, List[Key], WorkerEndpoint, List[WorkerEndpoint]) = synchronized {
-    // 1. IP 기반 ID 조회 (복구) 또는 신규 생성
     val workerId: ID = ipToId.getOrElse(workerAddress.ip, {
-      // --- 신규 등록 로직 ---
       val newId: ID = allWorkerEndpoints.size
       ipToId(workerAddress.ip) = newId
 
@@ -48,7 +42,7 @@ class MasterState(numWorkers: Int) {
       val newEndpoint = WorkerEndpoint(newId, workerAddress)
       allWorkerEndpoints.addOne(newEndpoint)
 
-      logger.info(s"New Worker Registered: ID=$newId, IP=${workerAddress.ip}")
+      Logging.logInfo(s"New Worker Registered: ID=$newId, IP=${workerAddress.ip}")
       newId
     })
 
@@ -58,7 +52,7 @@ class MasterState(numWorkers: Int) {
     if (currentEndpoint.address.port != workerAddress.port) {
       val updatedEndpoint = currentEndpoint.copy(address = workerAddress)
       allWorkerEndpoints(workerId) = updatedEndpoint
-      logger.info(s"Worker $workerId port updated: ${currentEndpoint.address.port} -> ${workerAddress.port}")
+      Logging.logInfo(s"Worker $workerId port updated: ${currentEndpoint.address.port} -> ${workerAddress.port}")
     }
 
     val myEndpoint = allWorkerEndpoints(workerId)
@@ -72,7 +66,7 @@ class MasterState(numWorkers: Int) {
       Sampling
     }
 
-    logger.info(s"Worker $workerId (${workerAddress.ip}) registered/recovered. State: $assignedState. Workers: ${ipToId.size}/$numWorkers")
+    Logging.logInfo(s"Worker $workerId (${workerAddress.ip}) registered/recovered. State: $assignedState. Workers: ${ipToId.size}/$numWorkers")
 
     val splittersToSend = if (assignedState.id >= Shuffling.id) globalSplitters else null
 
@@ -87,7 +81,7 @@ class MasterState(numWorkers: Int) {
 
     val receivedCount = workerSamples.count(_.isDefined)
     if (receivedCount == numWorkers) {
-      logger.info("All samples received. Calculating splitters...")
+      Logging.logInfo("All samples received. Calculating splitters...")
       calculateSplitters()
       return true
     }
@@ -98,10 +92,10 @@ class MasterState(numWorkers: Int) {
     if (!isValidWorker(workerId)) return false
 
     shuffleReadyWorkers.add(workerId)
-    logger.info(s"Worker $workerId ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
+    Logging.logInfo(s"Worker $workerId ready for shuffle. (${shuffleReadyWorkers.size}/$numWorkers)")
 
     if (shuffleReadyWorkers.size == numWorkers) {
-      logger.info("Barrier Reached! Releasing all workers...")
+      Logging.logInfo("Barrier Reached! Releasing all workers...")
       notifyAll()
       return true
     }
@@ -122,10 +116,10 @@ class MasterState(numWorkers: Int) {
     if (!isValidWorker(workerId)) return false
 
     completedShuffleWorkers.add(workerId)
-    logger.info(s"Worker $workerId finished shuffling. (${completedShuffleWorkers.size}/$numWorkers)")
+    Logging.logInfo(s"Worker $workerId finished shuffling. (${completedShuffleWorkers.size}/$numWorkers)")
 
     if (completedShuffleWorkers.size == numWorkers) {
-      logger.info("All workers finished shuffling. Moving cluster to MERGING phase.")
+      Logging.logInfo("All workers finished shuffling. Moving cluster to MERGING phase.")
 
       for (id <- workerStatus.indices) {
         if (workerStatus(id) != Failed) {
@@ -161,7 +155,7 @@ class MasterState(numWorkers: Int) {
   private def isValidWorker(workerId: ID): Boolean = {
     val valid = workerId >= 0 && workerId < workerStatus.size
     if (!valid) {
-      logger.warning(s"Ignored request from unknown or invalid Worker ID: $workerId")
+      Logging.logWarning(s"Ignored request from unknown or invalid Worker ID: $workerId")
     }
     valid
   }
@@ -183,6 +177,6 @@ class MasterState(numWorkers: Int) {
     }
 
     globalSplitters = splitters.toList
-    logger.info(s"Splitters calculated: ${globalSplitters.size} keys generated from ${allSamples.length} samples.")
+    Logging.logInfo(s"Splitters calculated: ${globalSplitters.size} keys generated from ${allSamples.length} samples.")
   }
 }

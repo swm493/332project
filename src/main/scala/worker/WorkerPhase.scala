@@ -1,7 +1,7 @@
 package worker
 
-import services.{Constant, NetworkUtils, NodeAddress, PartitionID, StorageService}
-import services.WorkerState.*
+import utils.{Constant, NetworkUtils, NodeAddress, PartitionID, FileUtils}
+import utils.WorkerState.*
 import sorting.master.{NotifyRequest, SampleRequest}
 import sorting.common.ProtoKey
 import com.google.protobuf.ByteString
@@ -25,8 +25,8 @@ class SamplingPhase extends WorkerPhase {
     println("[Phase] Sampling Started")
     val samples = ListBuffer[Array[Byte]]()
 
-    for (dir <- ctx.inputDirs; file <- StorageService.listFiles(dir)) {
-      samples ++= StorageService.extractSamples(file)
+    for (dir <- ctx.inputDirs; file <- FileUtils.listFiles(dir)) {
+      samples ++= FileUtils.extractSamples(file)
     }
 
     val protoSamples = samples.map(k => ProtoKey(ByteString.copyFrom(k))).toSeq
@@ -100,13 +100,13 @@ class ShufflePhase extends WorkerPhase {
 
       println("Step A: Local Sort & Indexing...")
 
-      val allInputFiles = ctx.inputDirs.flatMap(dir => StorageService.listFiles(dir))
+      val allInputFiles = ctx.inputDirs.flatMap(dir => FileUtils.listFiles(dir))
 
       var chunkId = 0
 
       val sortFutures = allInputFiles.zipWithIndex.map { case (file, idx) =>
         Future {
-          val recordsIter = StorageService.readRecords(file)
+          val recordsIter = FileUtils.readRecords(file)
           val currentBlock = new ListBuffer[Array[Byte]]()
           var currentSize = 0L
           var subChunkId = 0
@@ -116,7 +116,7 @@ class ShufflePhase extends WorkerPhase {
             currentBlock += record
             currentSize += record.length
 
-            if (currentSize >= services.Constant.Size.block) {
+            if (currentSize >= utils.Constant.Size.block) {
               val uniqueId = s"${idx}_${subChunkId}"
               processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDir, generatedChunks)
               currentBlock.clear()
@@ -201,7 +201,7 @@ class ShufflePhase extends WorkerPhase {
   }
 
   private def processBlock(blockData: Array[Array[Byte]], id: String, ctx: WorkerContext, tempChunkDir: File, generatedChunks: java.util.Queue[(File, File)]): Unit = {
-    scala.util.Sorting.quickSort(blockData)(services.RecordOrdering.ordering)
+    scala.util.Sorting.quickSort(blockData)(utils.RecordOrdering.ordering)
 
     val segments = findPartitionSegments(blockData, ctx)
 
@@ -294,7 +294,7 @@ class MergePhase extends WorkerPhase {
 
           val bos = new BufferedOutputStream(new FileOutputStream(finalFile))
           try {
-            services.MergeService.merge(
+            utils.MergeUtils.merge(
               iterators,
               record => bos.write(record)
             )

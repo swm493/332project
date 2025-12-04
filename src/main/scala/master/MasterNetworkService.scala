@@ -2,24 +2,19 @@ package master
 
 import scala.concurrent.{ExecutionContext, Future}
 import com.google.protobuf.ByteString
-import services.NetworkUtils
+import utils.{Logging, NetworkUtils}
 
-import java.util.logging.Logger
-
-// 프로젝트 의존성
-import services.{Key, ID}
-import services.WorkerState._
+import utils.{Key, ID}
+import utils.WorkerState._
 import sorting.master._
 import sorting.common._
 
 class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
   extends MasterServiceGrpc.MasterService {
 
-  private val logger = Logger.getLogger(classOf[MasterNetworkService].getName)
-
   override def registerWorker(req: RegisterRequest): Future[RegisterReply] = {
     val protoAddress = req.workerAddress.getOrElse(throw new IllegalArgumentException("Worker address is missing"))
-    val domainAddress = services.NodeAddress(protoAddress.ip, protoAddress.port)
+    val domainAddress = utils.NodeAddress(protoAddress.ip, protoAddress.port)
 
     val (assignedState, splitters, myDomainEndpoint, allDomainEndpoints) = state.registerWorker(domainAddress)
 
@@ -83,7 +78,7 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     new Thread(() => {
       try {
         Thread.sleep(2000)
-        logger.info("Master shutting down now.")
+        Logging.logInfo("Master shutting down now.")
         System.exit(0)
       } catch { case e: InterruptedException => e.printStackTrace() }
     }).start()
@@ -94,11 +89,11 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     else keys.map(k => ProtoKey(ByteString.copyFrom(k)))
   }
 
-  private def toDomainEndpoint(proto: sorting.common.WorkerEndpoint): services.WorkerEndpoint = {
+  private def toDomainEndpoint(proto: sorting.common.WorkerEndpoint): utils.WorkerEndpoint = {
     val protoAddress = proto.address.getOrElse(throw new IllegalArgumentException("Address is missing"))
-    services.WorkerEndpoint(
+    utils.WorkerEndpoint(
       id = proto.id.toInt,
-      address = services.NodeAddress(protoAddress.ip, protoAddress.port)
+      address = utils.NodeAddress(protoAddress.ip, protoAddress.port)
     )
   }
 }

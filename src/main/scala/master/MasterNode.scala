@@ -1,15 +1,12 @@
 package master
 
 import io.grpc.{Server, ServerBuilder}
-import services.{MasterEndpoint, NodeAddress, NetworkUtils}
+import utils.{Logging, MasterEndpoint, NetworkUtils, NodeAddress}
 
 import scala.concurrent.ExecutionContext
-import java.util.logging.Logger
 import sorting.master.*
 
 class MasterNode(executionContext: ExecutionContext, val numWorkers: Int) {
-  private val logger = Logger.getLogger(classOf[MasterNode].getName)
-
   private var masterEndpoint: MasterEndpoint = _
   private var server: Server = _
 
@@ -27,7 +24,7 @@ class MasterNode(executionContext: ExecutionContext, val numWorkers: Int) {
 
     masterEndpoint = MasterEndpoint(NodeAddress(actualIp, actualPort))
 
-    logger.info(s"Master server started. Listening on ${masterEndpoint.address}")
+    Logging.logEssential(s"Master server started. Listening on ${masterEndpoint.address}")
 
     sys.addShutdownHook { stop() }
     server.awaitTermination()

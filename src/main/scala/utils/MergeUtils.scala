@@ -1,8 +1,8 @@
-package services
+package utils
 
 import java.util.PriorityQueue
 
-object MergeService {
+object MergeUtils {
 
   /**
    * 바이트 배열 비교 로직 (Unsigned Lexicographical)
@@ -15,7 +15,7 @@ object MergeService {
       val (bytesB, _) = y
 
       var i = 0
-      while (i < services.Constant.Size.key) {
+      while (i < utils.Constant.Size.key) {
         val a = bytesA(i) & 0xFF
         val b = bytesB(i) & 0xFF
         if (a != b) return a - b

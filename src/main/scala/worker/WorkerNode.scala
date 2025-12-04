@@ -1,19 +1,15 @@
 package worker
 
 import io.grpc.{ManagedChannelBuilder, Server, ServerBuilder}
-import java.util.logging.Logger
+
 import scala.concurrent.ExecutionContext
-import services.WorkerState
-import services.WorkerState.*
+import utils.{Logging, NetworkUtils, PartitionID, Port, WorkerState}
+import utils.WorkerState.*
 import sorting.common.*
 import sorting.master.*
-import services.Constant.Ports
 import sorting.worker.*
-import services.{PartitionID, Port, NetworkUtils}
 
 class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
-  private val logger = Logger.getLogger(classOf[WorkerNode].getName)
-
   private val Array(host, port) = masterAddress.split(":")
   private val channel = ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build
   private val masterClient = MasterServiceGrpc.blockingStub(channel)
@@ -23,7 +19,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   private var server: Server = _
 
   private val onDataReceived = (partitionID: PartitionID, data: Array[Byte]) => {
-    logger.info(s"Received partition $partitionID data (${data.length} bytes)")
+    Logging.logInfo(s"Received partition $partitionID data (${data.length} bytes)")
     context.handleReceivedData(partitionID, data)
   }
 
@@ -43,11 +39,10 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       .build
       .start()
 
-    val actualPort: Port = server.getPort()
+    val actualPort: Port = server.getPort
     context.updateSelfPort(actualPort)
 
-    logger.info(s"Worker server started on ${context.selfAddress}")
-    logger.info(s"Worker connecting to Master at $masterAddress")
+    Logging.logEssential(s"Worker server started on ${context.selfAddress}")
 
     try {
       runWorkerLoop()
@@ -64,8 +59,8 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
         currentState = register()
       } catch {
         case e: Exception =>
-          logger.warning(s"Failed to register with Master (${masterAddress}): ${e.getMessage}")
-          logger.info("Retrying in 5 seconds...")
+          Logging.logWarning(s"Failed to register with Master ($masterAddress): ${e.getMessage}")
+          Logging.logInfo("Retrying in 5 seconds...")
           try { Thread.sleep(5000) } catch { case _: InterruptedException => }
       }
     }
@@ -95,12 +90,12 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             }
 
           case _ =>
-            logger.warning(s"Unknown state: $currentState")
+            Logging.logWarning(s"Unknown state: $currentState")
             Thread.sleep(1000)
         }
       } catch {
         case e: Exception =>
-          logger.severe(s"Error in loop: ${e.getMessage}")
+          Logging.logSevere(s"Error in loop: ${e.getMessage}")
           e.printStackTrace()
           Thread.sleep(5000)
           currentState = pollHeartbeat()
@@ -109,7 +104,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   }
 
   private def stop(): Unit = {
-    logger.info("Worker shutting down...")
+    Logging.logInfo("Worker shutting down...")
     if (context != null) context.shutdown()
     if (server != null) server.shutdown()
     if (channel != null) channel.shutdown()
@@ -124,7 +119,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
     if (res.workerEndpoint.isDefined) {
       context.myEndpoint = toDomain(res.workerEndpoint.get)
-      logger.info(s"Registered as Worker ID ${context.myEndpoint.id}")
+      Logging.logInfo(s"Registered as Worker ID ${context.myEndpoint.id}")
     }
 
     updateContextData(res.splitters, res.allWorkerEndpoints)
@@ -143,7 +138,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       val res = masterClient.getGlobalState(req)
       updateContextData(res.splitters, res.allWorkerEndpoints)
     } catch {
-      case e: Exception => logger.warning(s"Failed to fetch global state: ${e.getMessage}")
+      case e: Exception => Logging.logWarning(s"Failed to fetch global state: ${e.getMessage}")
     }
   }
 
@@ -164,8 +159,8 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     }
   }
 
-  private def toDomain(proto: sorting.common.WorkerEndpoint): services.WorkerEndpoint = {
+  private def toDomain(proto: sorting.common.WorkerEndpoint): utils.WorkerEndpoint = {
     val addr = proto.address.get
-    services.WorkerEndpoint(proto.id.toInt, services.NodeAddress(addr.ip, addr.port))
+    utils.WorkerEndpoint(proto.id.toInt, utils.NodeAddress(addr.ip, addr.port))
   }
 }
