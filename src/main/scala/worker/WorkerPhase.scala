@@ -3,8 +3,7 @@ package worker
 import com.google.protobuf.ByteString
 import sorting.common.ProtoKey
 import sorting.master.SampleRequest
-import utils.WorkerState.*
-import utils.{WorkerState, *}
+import utils.*
 
 import java.io.*
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -14,13 +13,13 @@ import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future}
 
 trait WorkerPhase {
-  def execute(ctx: WorkerContext): WorkerState
+  def execute(ctx: WorkerContext): Unit
 }
 
 case class PartitionSegment(partitionId: PartitionID, offset: Long, length: Int)
 
 class SamplingPhase extends WorkerPhase {
-  override def execute(ctx: WorkerContext): WorkerState = {
+  override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Sampling Started")
     val samples = ListBuffer[Array[Byte]]()
 
@@ -36,12 +35,11 @@ class SamplingPhase extends WorkerPhase {
     ))
 
     Logging.logInfo(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
-    Partitioning
   }
 }
 
 class PartitioningPhase extends WorkerPhase {
-  override def execute(ctx: WorkerContext): WorkerState = {
+  override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Partitioning Started (Local Sort & Spill)")
 
     val tempChunkDirFile = new File(ctx.outputDir, "temp_chunks")
@@ -82,8 +80,6 @@ class PartitioningPhase extends WorkerPhase {
 
     Await.result(Future.sequence(partitionFutures), Duration.Inf)
     Logging.logInfo(s"[Phase] Partitioning Complete. Generated ${generatedChunks.size()} chunks.")
-
-    Shuffling
   }
 
   private def processBlock(blockData: Array[Array[Byte]], id: String, ctx: WorkerContext, tempChunkDir: File, generatedChunks: java.util.Queue[(File, File)]): Unit = {
@@ -140,7 +136,7 @@ class PartitioningPhase extends WorkerPhase {
 }
 
 class ShufflePhase extends WorkerPhase {
-  override def execute(ctx: WorkerContext): WorkerState = {
+  override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Shuffling Started (Network Transfer)")
 
     val P = Constant.Size.partitionPerWorker
@@ -224,8 +220,6 @@ class ShufflePhase extends WorkerPhase {
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
       ctx.setCustomDataHandler(null)
     }
-
-    Merging
   }
 
   private def loadIndex(file: File): List[PartitionSegment] = {
@@ -242,7 +236,7 @@ class ShufflePhase extends WorkerPhase {
 }
 
 class MergePhase extends WorkerPhase {
-  override def execute(ctx: WorkerContext): WorkerState = {
+  override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Merging Started")
 
     val P = Constant.Size.partitionPerWorker
@@ -280,7 +274,6 @@ class MergePhase extends WorkerPhase {
     Await.result(Future.sequence(mergeFutures), Duration.Inf)
 
     Logging.logInfo("[Phase] Merging Done.")
-    Done
   }
 
   private def loadChunkLengths(file: File): List[Int] = {
