@@ -1,8 +1,8 @@
 package worker
 
 import utils.{Constant, FileUtils, Logging, NetworkUtils, PartitionID}
-import utils.WorkerState.*
-import sorting.master.{NotifyRequest, SampleRequest}
+import utils.WorkerState._
+import sorting.master.SampleRequest
 import sorting.common.ProtoKey
 import com.google.protobuf.ByteString
 
@@ -36,7 +36,6 @@ class SamplingPhase extends WorkerPhase {
     ))
 
     Logging.logInfo(s"[Phase] Sampling Done. Submitted ${samples.size} samples.")
-    // Partitioning 단계로 넘어갑니다.
     Partitioning
   }
 }
@@ -50,12 +49,10 @@ class PartitioningPhase extends WorkerPhase {
     else {
       FileUtils.listFiles(tempChunkDirFile.getAbsolutePath).foreach(_.delete())
     }
-    val tempChunkDir = tempChunkDirFile.getAbsolutePath
 
     val generatedChunks = new ConcurrentLinkedQueue[(File, File)]()
     val allInputFiles = ctx.inputDirs.flatMap(dir => FileUtils.listFiles(dir))
 
-    // 병렬 처리: 파일을 읽어 정렬 후 디스크에 저장 (Spill)
     val partitionFutures = allInputFiles.zipWithIndex.map { case (file, idx) =>
       Future {
         val recordsIter = FileUtils.readRecords(file)
@@ -68,18 +65,16 @@ class PartitioningPhase extends WorkerPhase {
           currentBlock += record
           currentSize += record.length
 
-          // Block 크기만큼 모이면 처리
           if (currentSize >= utils.Constant.Size.block) {
-            val uniqueId = s"${idx}_${subChunkId}"
+            val uniqueId = s"${idx}_$subChunkId"
             processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDirFile, generatedChunks)
             currentBlock.clear()
             currentSize = 0
             subChunkId += 1
           }
         }
-        // 남은 데이터 처리
         if (currentBlock.nonEmpty) {
-          val uniqueId = s"${idx}_${subChunkId}"
+          val uniqueId = s"${idx}_$subChunkId"
           processBlock(currentBlock.toArray, uniqueId, ctx, tempChunkDirFile, generatedChunks)
         }
       }(ctx.executionContext)
@@ -88,24 +83,16 @@ class PartitioningPhase extends WorkerPhase {
     Await.result(Future.sequence(partitionFutures), Duration.Inf)
     Logging.logInfo(s"[Phase] Partitioning Complete. Generated ${generatedChunks.size()} chunks.")
 
-    // Shuffling 단계로 넘어갑니다.
     Shuffling
   }
 
   private def processBlock(blockData: Array[Array[Byte]], id: String, ctx: WorkerContext, tempChunkDir: File, generatedChunks: java.util.Queue[(File, File)]): Unit = {
-    // 1. 로컬 정렬
     scala.util.Sorting.quickSort(blockData)(utils.RecordOrdering.ordering)
-
-    // 2. 파티션 구간 찾기
     val segments = findPartitionSegments(blockData, ctx)
-
-    // 3. 파일로 저장
     val dataFile = new File(tempChunkDir, s"chunk_$id.data")
     val indexFile = new File(tempChunkDir, s"chunk_$id.index")
-
     saveSortedBlock(blockData, dataFile)
     saveIndex(segments, indexFile)
-
     generatedChunks.add((dataFile, indexFile))
   }
 
@@ -193,17 +180,8 @@ class ShufflePhase extends WorkerPhase {
       }
     }
 
-    // 3. 배리어 동기화 (모든 워커가 받을 준비가 될 때까지 대기)
-    Logging.logInfo("Ready to receive data. Waiting for Barrier synchronization...")
-    try {
-      ctx.masterClient.checkShuffleReady(
-        sorting.master.ShuffleReadyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint)))
-      )
-      Logging.logInfo("Barrier Passed! Starting Batch Sending...")
-    } catch {
-      case e: Exception =>
-        Logging.logInfo(s"Barrier failed: ${e.getMessage}")
-    }
+    // [제거됨] 3. 배리어 동기화 (checkShuffleReady) -> WorkerNode에서 수행함
+    // [제거됨] 5. 완료 알림 및 글로벌 동기화 (notifyShuffleComplete) -> WorkerNode에서 수행함
 
     // 4. 데이터 전송 (Batch Sending)
     try {
@@ -221,16 +199,14 @@ class ShufflePhase extends WorkerPhase {
         try {
           for (seg <- segments) {
             val targetWorkerIdx = seg.partitionId / P
-
             if (targetWorkerIdx < ctx.allWorkerEndpoints.length) {
               val targetEndpoint = ctx.allWorkerEndpoints(targetWorkerIdx)
-              // 해당 세그먼트 데이터 읽기
               val chunkBytes = new Array[Byte](seg.length)
               raf.seek(seg.offset)
               raf.readFully(chunkBytes)
 
               if (targetEndpoint == ctx.myEndpoint) {
-                // 자기 자신에게 보내는 경우 (직접 쓰기)
+                // Self sending
                 val stream = partitionStreams(seg.partitionId)
                 val idxStream = partitionIndexStreams(seg.partitionId)
                 stream.synchronized {
@@ -238,7 +214,7 @@ class ShufflePhase extends WorkerPhase {
                   idxStream.writeInt(chunkBytes.length)
                 }
               } else {
-                // 다른 워커에게 전송
+                // Remote sending
                 ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
               }
             }
@@ -252,28 +228,11 @@ class ShufflePhase extends WorkerPhase {
 
       Logging.logInfo("Sending complete. Deleting temporary chunks...")
 
-      // 임시 파일 정리
       chunkFiles.foreach { case (dataFile, indexFile) =>
         if (dataFile.exists()) dataFile.delete()
         if (indexFile.exists()) indexFile.delete()
       }
       if (tempChunkDir.exists()) tempChunkDir.delete()
-
-      // 5. 완료 알림 및 글로벌 동기화
-      Logging.logInfo("Notifying Master and waiting for Global Sync...")
-
-      ctx.masterClient.notifyShuffleComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
-
-      var globalDone = false
-      while (!globalDone) {
-        val hb = ctx.masterClient.heartbeat(sorting.master.HeartbeatRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
-        if (hb.state == sorting.master.HeartbeatReply.WorkerHeartState.Merging) {
-          globalDone = true
-        } else {
-          Thread.sleep(100)
-        }
-      }
-      Logging.logInfo("Global Shuffle Complete! Proceeding to cleanup.")
 
     } finally {
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
@@ -281,6 +240,7 @@ class ShufflePhase extends WorkerPhase {
       ctx.setCustomDataHandler(null)
     }
 
+    // 다음 단계 반환 (WorkerNode가 notifyShuffleComplete를 호출함)
     Merging
   }
 
@@ -337,7 +297,6 @@ class MergePhase extends WorkerPhase {
 
     Await.result(Future.sequence(mergeFutures), Duration.Inf)
 
-    ctx.masterClient.notifyMergeComplete(NotifyRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(ctx.myEndpoint))))
     Logging.logInfo("[Phase] Merging Done.")
     Done
   }

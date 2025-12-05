@@ -10,7 +10,6 @@ message ShuffleReply {
   bool success = 1;
 }
 
-
 service WorkerService {
   rpc Shuffle (stream ShuffleRecord) returns (ShuffleReply);
 }

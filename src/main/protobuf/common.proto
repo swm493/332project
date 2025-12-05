@@ -15,3 +15,14 @@ message WorkerEndpoint {
 message ProtoKey {
   bytes key = 1;
 }
+
+enum ProtoWorkerState {
+  Unregistered = 0;
+  Sampling = 1;
+  Partitioning = 2;
+  Shuffling = 3;
+  Merging = 4;
+  Done = 5;
+  Failed = 6;
+  Waiting = 7;
+}

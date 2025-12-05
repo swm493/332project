@@ -32,8 +32,8 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
 
     val s = state.getWorkerStatus(workerId)
     val responseState = s match {
-      case Partitioning | Shuffling if !state.isShufflingReady => HeartbeatReply.WorkerHeartState.Waiting
-      case _ => HeartbeatReply.WorkerHeartState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerHeartState.Unregistered)
+      case Partitioning | Shuffling if !state.isShufflingReady => ProtoWorkerState.Waiting
+      case _ => ProtoWorkerState.fromName(s.toString).getOrElse(ProtoWorkerState.Unregistered)
     }
     Future.successful(HeartbeatReply(state = responseState))
   }
@@ -46,13 +46,6 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     ))
   }
 
-  override def checkShuffleReady(req: ShuffleReadyRequest): Future[ShuffleReadyReply] = {
-    val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
-    // 이 요청이 오면 MasterState 내부에서 해당 워커 상태를 Shuffling으로 업데이트함
-    val isSuccess = if (workerId != -1) state.waitForShuffleReady(workerId) else false
-    Future.successful(ShuffleReadyReply(allReady = isSuccess))
-  }
-
   override def submitSamples(req: SampleRequest): Future[SampleReply] = {
     val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
     val samples = req.samples.map(_.key.toByteArray).toList
@@ -60,19 +53,31 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     Future.successful(SampleReply(ack = true))
   }
 
-  override def notifyShuffleComplete(req: NotifyRequest): Future[NotifyReply] = {
+  override def notifyPhaseComplete(req: PhaseCompleteRequest): Future[PhaseCompleteReply] = {
     val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
-    if (workerId != -1) state.updateShuffleStatus(workerId)
-    Future.successful(NotifyReply(ack = true))
-  }
+    val phase = req.phase
 
-  override def notifyMergeComplete(req: NotifyRequest): Future[NotifyReply] = {
-    val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
     if (workerId != -1) {
-      state.updateMergeStatus(workerId)
-      if (state.isAllWorkersFinished) scheduleShutdown()
+      phase match {
+        case ProtoWorkerState.Sampling =>
+          Logging.logInfo(s"Worker $workerId notified Sampling complete.")
+
+        case ProtoWorkerState.Partitioning =>
+          state.waitForShuffleReady(workerId)
+
+        case ProtoWorkerState.Shuffling =>
+          state.updateShuffleStatus(workerId)
+
+        case ProtoWorkerState.Merging =>
+          state.updateMergeStatus(workerId)
+          if (state.isAllWorkersFinished) scheduleShutdown()
+
+        case _ =>
+          Logging.logWarning(s"Received unexpected phase completion signal from Worker $workerId: $phase")
+      }
     }
-    Future.successful(NotifyReply(ack = true))
+
+    Future.successful(PhaseCompleteReply(ack = true))
   }
 
   private def scheduleShutdown(): Unit = {

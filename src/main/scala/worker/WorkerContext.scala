@@ -1,10 +1,10 @@
 package worker
 
 import sorting.master.*
-import utils.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID}
+import utils.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID, NetworkUtils}
 import utils.RecordOrdering.ordering.compare
 
-import java.util.concurrent.{ConcurrentLinkedQueue, Executors} // Executors 추가
+import java.util.concurrent.{ConcurrentLinkedQueue, Executors}
 import scala.concurrent.ExecutionContext
 import scala.jdk.CollectionConverters.*
 
@@ -13,20 +13,22 @@ class WorkerContext(
                      val outputDir: String,
                      val masterClient: MasterServiceGrpc.MasterServiceBlockingStub
                    ) {
-  private val selfIP: IP = utils.NetworkUtils.findLocalIpAddress()
+  // 로컬 IP 탐색
+  private val selfIP: IP = NetworkUtils.findLocalIpAddress()
 
   var selfAddress: NodeAddress = NodeAddress(selfIP, 0)
 
   var myEndpoint: WorkerEndpoint = _
-  var allWorkerEndpoints: List[WorkerEndpoint] = _
-  var splitters: List[Key] = _
+
+  var allWorkerEndpoints: List[WorkerEndpoint] = List.empty
+  var splitters: List[Key] = List.empty
 
   var networkService: WorkerNetworkService = _
 
   // CPU 코어 수(4개)만큼의 스레드 풀 생성
-  private val executorService = java.util.concurrent.Executors.newFixedThreadPool(4)
-  val executionContext: scala.concurrent.ExecutionContext =
-    scala.concurrent.ExecutionContext.fromExecutorService(executorService)
+  private val executorService = Executors.newFixedThreadPool(4)
+  val executionContext: ExecutionContext =
+    ExecutionContext.fromExecutorService(executorService)
 
   // 파티션 ID는 Int (PartitionID)
   @volatile private var dataHandler: (PartitionID, Array[Byte]) => Unit = _
@@ -55,10 +57,10 @@ class WorkerContext(
     receivedDataQueue.asScala.toList
   }
 
-  def isReadyForShuffle: Boolean = splitters != null && allWorkerEndpoints != null
+  def isReadyForShuffle: Boolean = splitters.nonEmpty && allWorkerEndpoints.nonEmpty
 
   def findPartitionIndex(key: Key): Int = {
-    if (splitters == null || splitters.isEmpty) return 0
+    if (splitters.isEmpty) return 0
 
     var left = 0
     var right = splitters.length - 1

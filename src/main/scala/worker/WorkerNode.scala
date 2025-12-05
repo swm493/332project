@@ -1,13 +1,12 @@
 package worker
 
 import io.grpc.{ManagedChannelBuilder, Server, ServerBuilder}
-
 import scala.concurrent.ExecutionContext
 import utils.{Logging, NetworkUtils, PartitionID, Port, WorkerState}
-import utils.WorkerState.*
-import sorting.common.*
-import sorting.master.*
-import sorting.worker.*
+import utils.WorkerState._
+import sorting.common._
+import sorting.master._
+import sorting.worker._
 
 class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
   private val Array(host, port) = masterAddress.split(":")
@@ -66,7 +65,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       }
     }
 
-    // 2. 메인 상태 머신 루프
+    // 메인 상태 머신 루프
     while (currentState != Done && currentState != Failed) {
       try {
         currentState match {
@@ -78,13 +77,11 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             currentState = pollHeartbeat()
 
           case s if phases.contains(s) =>
-            // [Partitioning] 시작 전 Splitter 정보가 없으면 Master에서 받아옴
+            // 1. 필요한 경우 전역 상태 동기화
             if (s == Partitioning && context.splitters.isEmpty) {
               Logging.logInfo("Fetching global state for splitters...")
               fetchGlobalState()
             }
-
-            // [Shuffling] 시작 전 전체 Worker Endpoint 정보가 없으면 Master에서 받아옴
             if (s == Shuffling && !context.isReadyForShuffle) {
               Logging.logInfo("Fetching global state for shuffle peers...")
               fetchGlobalState()
@@ -97,7 +94,14 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             }
 
             if (canExecute) {
+              // 2. 해당 Phase 실행 (로컬 작업)
               val nextExpected = phases(s).execute(context)
+
+              // 3. Master에게 작업 완료 알림 (통합된 RPC 사용)
+              // Sampling 포함 모든 단계에서 완료 신호를 보냄
+              notifyMasterPhaseComplete(s)
+
+              // 4. Master가 상태를 변경해줄 때까지 대기
               waitForState(nextExpected)
               currentState = nextExpected
             } else {
@@ -116,6 +120,33 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
           e.printStackTrace()
           Thread.sleep(5000)
           currentState = pollHeartbeat()
+      }
+    }
+  }
+
+  // --- [UPDATE] 통합된 PhaseComplete RPC 호출 ---
+  private def notifyMasterPhaseComplete(state: WorkerState): Unit = {
+    val myEndpointProto = NetworkUtils.workerEndpointToProto(context.myEndpoint)
+
+    // WorkerState를 Proto Enum으로 변환
+    val protoPhase = state match {
+      case Sampling     => ProtoWorkerState.Sampling      // [추가] Sampling도 완료 알림 전송
+      case Partitioning => ProtoWorkerState.Partitioning
+      case Shuffling    => ProtoWorkerState.Shuffling
+      case Merging      => ProtoWorkerState.Merging
+      case _            => ProtoWorkerState.Unregistered
+    }
+
+    if (protoPhase != ProtoWorkerState.Unregistered) {
+      Logging.logInfo(s"[$state] Local task done. Sending PhaseComplete($protoPhase) to Master...")
+      try {
+        masterClient.notifyPhaseComplete(PhaseCompleteRequest(
+          workerEndpoint = Some(myEndpointProto),
+          phase = protoPhase
+        ))
+        Logging.logInfo(s"[$state] Master acknowledged phase completion.")
+      } catch {
+        case e: Exception => Logging.logWarning(s"Failed to notify phase complete: ${e.getMessage}")
       }
     }
   }
@@ -151,9 +182,18 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private def fetchGlobalState(): Unit = {
     try {
+      Logging.logInfo(s"[fetchGlobalState] Requesting state for myEndpoint: ${context.myEndpoint}")
+
       val req = GetGlobalStateRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(context.myEndpoint)))
       val res = masterClient.getGlobalState(req)
+
+      val splittersCount = if (res.splitters != null) res.splitters.size else "null"
+      val workersCount = if (res.allWorkerEndpoints != null) res.allWorkerEndpoints.size else "null"
+      Logging.logInfo(s"[fetchGlobalState] Received -> Splitters: $splittersCount, Workers: $workersCount")
+
       updateContextData(res.splitters, res.allWorkerEndpoints)
+
+      Logging.logInfo("[fetchGlobalState] Context updated successfully.")
     } catch {
       case e: Exception => Logging.logWarning(s"Failed to fetch global state: ${e.getMessage}")
     }
@@ -161,7 +201,12 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private def waitForState(target: WorkerState): Unit = {
     var s = pollHeartbeat()
-    while(s != target && s != Done && s != Failed) {
+    var retryCount = 0
+    while (s != target && s != Done && s != Failed) {
+      retryCount += 1
+      if (retryCount % 10 == 0) {
+        Logging.logInfo(s"Waiting for state change... Target: $target, Current from Master: $s")
+      }
       Thread.sleep(500)
       s = pollHeartbeat()
     }
