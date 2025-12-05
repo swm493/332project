@@ -1,17 +1,17 @@
 package worker
 
-import utils.{Constant, FileUtils, Logging, NetworkUtils, PartitionID}
-import utils.WorkerState._
-import sorting.master.SampleRequest
-import sorting.common.ProtoKey
 import com.google.protobuf.ByteString
+import sorting.common.ProtoKey
+import sorting.master.SampleRequest
+import utils.WorkerState.*
+import utils.{WorkerState, *}
 
 import java.io.*
-import scala.collection.mutable.ListBuffer
-import scala.concurrent.{Await, Future}
-import scala.concurrent.duration.Duration
 import java.util.concurrent.ConcurrentLinkedQueue
+import scala.collection.mutable.ListBuffer
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, Future}
 
 trait WorkerPhase {
   def execute(ctx: WorkerContext): WorkerState
@@ -150,7 +150,6 @@ class ShufflePhase extends WorkerPhase {
     val myStartIdx = myWorkerIdx * P
     val myEndIdx = myStartIdx + P
 
-    // 1. 수신부 준비 (Receive Files)
     val partitionStreams = new Array[BufferedOutputStream](totalPartitions)
     val partitionIndexStreams = new Array[DataOutputStream](totalPartitions)
     val outputFiles = new ListBuffer[File]()
@@ -168,7 +167,6 @@ class ShufflePhase extends WorkerPhase {
       partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
     }
 
-    // 2. 수신 핸들러 등록
     ctx.setCustomDataHandler { (pIdx, data) =>
       if (pIdx >= myStartIdx && pIdx < myEndIdx) {
         val stream = partitionStreams(pIdx)
@@ -180,10 +178,6 @@ class ShufflePhase extends WorkerPhase {
       }
     }
 
-    // [제거됨] 3. 배리어 동기화 (checkShuffleReady) -> WorkerNode에서 수행함
-    // [제거됨] 5. 완료 알림 및 글로벌 동기화 (notifyShuffleComplete) -> WorkerNode에서 수행함
-
-    // 4. 데이터 전송 (Batch Sending)
     try {
       val tempChunkDir = new File(ctx.outputDir, "temp_chunks")
       val chunkFiles = if (tempChunkDir.exists()) {
@@ -206,7 +200,6 @@ class ShufflePhase extends WorkerPhase {
               raf.readFully(chunkBytes)
 
               if (targetEndpoint == ctx.myEndpoint) {
-                // Self sending
                 val stream = partitionStreams(seg.partitionId)
                 val idxStream = partitionIndexStreams(seg.partitionId)
                 stream.synchronized {
@@ -214,7 +207,6 @@ class ShufflePhase extends WorkerPhase {
                   idxStream.writeInt(chunkBytes.length)
                 }
               } else {
-                // Remote sending
                 ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
               }
             }
@@ -226,21 +218,13 @@ class ShufflePhase extends WorkerPhase {
 
       if (ctx.networkService != null) ctx.networkService.finishSending()
 
-      Logging.logInfo("Sending complete. Deleting temporary chunks...")
-
-      chunkFiles.foreach { case (dataFile, indexFile) =>
-        if (dataFile.exists()) dataFile.delete()
-        if (indexFile.exists()) indexFile.delete()
-      }
-      if (tempChunkDir.exists()) tempChunkDir.delete()
-
+      Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
     } finally {
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
       ctx.setCustomDataHandler(null)
     }
 
-    // 다음 단계 반환 (WorkerNode가 notifyShuffleComplete를 호출함)
     Merging
   }
 
@@ -260,8 +244,6 @@ class ShufflePhase extends WorkerPhase {
 class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): WorkerState = {
     Logging.logInfo("[Phase] Merging Started")
-
-    if (ctx.networkService != null) ctx.networkService.closeChannels()
 
     val P = Constant.Size.partitionPerWorker
     val myWorkerIdx = ctx.allWorkerEndpoints.indexOf(ctx.myEndpoint)

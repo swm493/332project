@@ -5,7 +5,6 @@ import com.google.protobuf.ByteString
 import utils.{Logging, NetworkUtils}
 
 import utils.{Key, ID}
-import utils.WorkerState._
 import sorting.master._
 import sorting.common._
 
@@ -31,10 +30,9 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     val workerId: ID = domainEndpoint.id
 
     val s = state.getWorkerStatus(workerId)
-    val responseState = s match {
-      case Partitioning | Shuffling if !state.isShufflingReady => ProtoWorkerState.Waiting
-      case _ => ProtoWorkerState.fromName(s.toString).getOrElse(ProtoWorkerState.Unregistered)
-    }
+
+    val responseState = ProtoWorkerState.fromName(s.toString).getOrElse(ProtoWorkerState.Unregistered)
+
     Future.successful(HeartbeatReply(state = responseState))
   }
 
@@ -58,22 +56,11 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     val phase = req.phase
 
     if (workerId != -1) {
-      phase match {
-        case ProtoWorkerState.Sampling =>
-          Logging.logInfo(s"Worker $workerId notified Sampling complete.")
+      state.handlePhaseComplete(workerId, phase)
 
-        case ProtoWorkerState.Partitioning =>
-          state.waitForShuffleReady(workerId)
-
-        case ProtoWorkerState.Shuffling =>
-          state.updateShuffleStatus(workerId)
-
-        case ProtoWorkerState.Merging =>
-          state.updateMergeStatus(workerId)
-          if (state.isAllWorkersFinished) scheduleShutdown()
-
-        case _ =>
-          Logging.logWarning(s"Received unexpected phase completion signal from Worker $workerId: $phase")
+      // Merging이 끝나고 Done 상태가 되어 셧다운이 필요한지 체크
+      if (state.isAllWorkersFinished) {
+        scheduleShutdown()
       }
     }
 
@@ -83,8 +70,8 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
   private def scheduleShutdown(): Unit = {
     new Thread(() => {
       try {
-        Thread.sleep(2000)
-        Logging.logInfo("Master shutting down now.")
+        Thread.sleep(3000) // 모든 워커가 마지막 Heartbeat(Done)를 받을 시간을 줌
+        Logging.logInfo("All tasks completed. Master shutting down now.")
         System.exit(0)
       } catch { case e: InterruptedException => e.printStackTrace() }
     }).start()

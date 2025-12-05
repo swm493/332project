@@ -7,6 +7,7 @@ import utils.WorkerState._
 import sorting.common._
 import sorting.master._
 import sorting.worker._
+import java.io.File
 
 class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
   private val Array(host, port) = masterAddress.split(":")
@@ -65,8 +66,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       }
     }
 
-    // 메인 상태 머신 루프
-    while (currentState != Done && currentState != Failed) {
+    while (currentState != Done) {
       try {
         currentState match {
           case Unregistered =>
@@ -76,8 +76,20 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             Thread.sleep(1000)
             currentState = pollHeartbeat()
 
+          // [수정] Failed 시 Shuffling 복구 로직
+          case Failed =>
+            Logging.logSevere("Master signalled FAILURE. Rolling back to restart SHUFFLING Phase...")
+
+            // 1. Shuffling 관련 임시 파일 삭제 및 Global State 초기화 (Worker Endpoints 비움)
+            cleanupShuffleData()
+
+            Logging.logInfo("Cleanup complete. Forcing state to Shuffling...")
+            Thread.sleep(2000)
+
+            // 2. Shuffling 단계부터 바로 재시작
+            currentState = Shuffling
+
           case s if phases.contains(s) =>
-            // 1. 필요한 경우 전역 상태 동기화
             if (s == Partitioning && context.splitters.isEmpty) {
               Logging.logInfo("Fetching global state for splitters...")
               fetchGlobalState()
@@ -94,16 +106,9 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             }
 
             if (canExecute) {
-              // 2. 해당 Phase 실행 (로컬 작업)
-              val nextExpected = phases(s).execute(context)
-
-              // 3. Master에게 작업 완료 알림 (통합된 RPC 사용)
-              // Sampling 포함 모든 단계에서 완료 신호를 보냄
+              phases(s).execute(context)
               notifyMasterPhaseComplete(s)
-
-              // 4. Master가 상태를 변경해줄 때까지 대기
-              waitForState(nextExpected)
-              currentState = nextExpected
+              currentState = Waiting
             } else {
               Thread.sleep(1000)
               currentState = pollHeartbeat()
@@ -115,6 +120,10 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             currentState = pollHeartbeat()
         }
       } catch {
+        case e: RuntimeException if e.getMessage.contains("Master signaled Failed") =>
+          Logging.logWarning("Detected Failure signal during wait. Rolling back...")
+          currentState = Failed
+
         case e: Exception =>
           Logging.logSevere(s"Error in loop: ${e.getMessage}")
           e.printStackTrace()
@@ -124,13 +133,29 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     }
   }
 
-  // --- [UPDATE] 통합된 PhaseComplete RPC 호출 ---
+  // [수정] 셔플링/머지 파일 삭제 및 WorkerEndpoint 리스트 초기화
+  private def cleanupShuffleData(): Unit = {
+    Logging.logInfo("Cleaning up Shuffle/Merge temporary data...")
+    val outDir = new File(outputDir)
+    if (outDir.exists() && outDir.isDirectory) {
+      utils.FileUtils.listFiles(outDir.getAbsolutePath).foreach { f =>
+        // Partitioning 결과물인 temp_chunks는 건드리지 않음
+        // Shuffle/Merge 결과물인 partition_received_* 및 최종 partition.* 파일만 삭제
+        val name = f.getName
+        if (name.startsWith("partition_received") || name.startsWith("partition.")) {
+          f.delete()
+        }
+      }
+    }
+    // [수정] isReadyForShuffle 대신 allWorkerEndpoints를 비워 다시 fetchGlobalState를 유도
+    context.allWorkerEndpoints = List.empty
+  }
+
   private def notifyMasterPhaseComplete(state: WorkerState): Unit = {
     val myEndpointProto = NetworkUtils.workerEndpointToProto(context.myEndpoint)
 
-    // WorkerState를 Proto Enum으로 변환
     val protoPhase = state match {
-      case Sampling     => ProtoWorkerState.Sampling      // [추가] Sampling도 완료 알림 전송
+      case Sampling     => ProtoWorkerState.Sampling
       case Partitioning => ProtoWorkerState.Partitioning
       case Shuffling    => ProtoWorkerState.Shuffling
       case Merging      => ProtoWorkerState.Merging
@@ -183,32 +208,15 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
   private def fetchGlobalState(): Unit = {
     try {
       Logging.logInfo(s"[fetchGlobalState] Requesting state for myEndpoint: ${context.myEndpoint}")
-
       val req = GetGlobalStateRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(context.myEndpoint)))
       val res = masterClient.getGlobalState(req)
-
       val splittersCount = if (res.splitters != null) res.splitters.size else "null"
       val workersCount = if (res.allWorkerEndpoints != null) res.allWorkerEndpoints.size else "null"
       Logging.logInfo(s"[fetchGlobalState] Received -> Splitters: $splittersCount, Workers: $workersCount")
-
       updateContextData(res.splitters, res.allWorkerEndpoints)
-
       Logging.logInfo("[fetchGlobalState] Context updated successfully.")
     } catch {
       case e: Exception => Logging.logWarning(s"Failed to fetch global state: ${e.getMessage}")
-    }
-  }
-
-  private def waitForState(target: WorkerState): Unit = {
-    var s = pollHeartbeat()
-    var retryCount = 0
-    while (s != target && s != Done && s != Failed) {
-      retryCount += 1
-      if (retryCount % 10 == 0) {
-        Logging.logInfo(s"Waiting for state change... Target: $target, Current from Master: $s")
-      }
-      Thread.sleep(500)
-      s = pollHeartbeat()
     }
   }
 
