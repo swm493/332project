@@ -38,28 +38,19 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
   private val sendObservers = new ConcurrentHashMap[NodeAddress, StreamObserver[ShuffleRecord]]()
 
   def sendData(targetAddress: NodeAddress, partitionID: PartitionID, data: Array[Byte]): Unit = {
-    var sent = false
-    var retryCount = 0
-    val maxRetries = 5
-
-    while (!sent && retryCount < maxRetries) {
-      try {
-        val observer = getOrCreateObserver(targetAddress)
-        observer.synchronized {
-          observer.onNext(ShuffleRecord(partitionID = partitionID, data = ByteString.copyFrom(data)))
-        }
-        sent = true
-      } catch {
-        case e: Exception =>
-          Logging.logWarning(s"Send failed to $targetAddress (attempt ${retryCount+1}): ${e.getMessage}")
-          sendObservers.remove(targetAddress)
-          retryCount += 1
-          try { Thread.sleep(500) } catch { case _: InterruptedException => }
+    try {
+      val observer = getOrCreateObserver(targetAddress)
+      observer.synchronized {
+        observer.onNext(ShuffleRecord(
+          data = ByteString.copyFrom(data),
+          partitionID = partitionID
+        ))
       }
-    }
-
-    if (!sent) {
-      Logging.logSevere(s"Failed to send data to $targetAddress after $maxRetries attempts. Data lost?")
+    } catch {
+      case e: Exception =>
+        sendObservers.remove(targetAddress)
+        channels.remove(targetAddress)
+        throw new RuntimeException(s"Send failed to $targetAddress", e)
     }
   }
 
@@ -73,7 +64,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
       stub.shuffle(new StreamObserver[ShuffleReply] {
         override def onNext(value: ShuffleReply): Unit = {}
         override def onError(t: Throwable): Unit = {
-          Logging.logWarning(s"Error in send stream to $addr: ${t.getMessage}")
+          Logging.logWarning(s"Stream error to $addr: ${t.getMessage}")
           sendObservers.remove(addr)
         }
         override def onCompleted(): Unit = {}

@@ -80,10 +80,10 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
           case Failed =>
             Logging.logSevere("Master signalled FAILURE. Rolling back to restart SHUFFLING Phase...")
 
-            // 1. Shuffling 관련 임시 파일 삭제 및 Global State 초기화 (Worker Endpoints 비움)
-            cleanupShuffleData()
+            // 파일 삭제는 ShufflePhase 진입 시 자동 수행되므로, 여기서는 메모리 상태만 리셋
+            resetShuffleData()
 
-            Logging.logInfo("Cleanup complete. Forcing state to Shuffling...")
+            Logging.logInfo("State reset complete. Forcing state to Shuffling...")
             Thread.sleep(2000)
 
             // 2. Shuffling 단계부터 바로 재시작
@@ -133,21 +133,9 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     }
   }
 
-  // [수정] 셔플링/머지 파일 삭제 및 WorkerEndpoint 리스트 초기화
-  private def cleanupShuffleData(): Unit = {
-    Logging.logInfo("Cleaning up Shuffle/Merge temporary data...")
-    val outDir = new File(outputDir)
-    if (outDir.exists() && outDir.isDirectory) {
-      utils.FileUtils.listFiles(outDir.getAbsolutePath).foreach { f =>
-        // Partitioning 결과물인 temp_chunks는 건드리지 않음
-        // Shuffle/Merge 결과물인 partition_received_* 및 최종 partition.* 파일만 삭제
-        val name = f.getName
-        if (name.startsWith("partition_received") || name.startsWith("partition.")) {
-          f.delete()
-        }
-      }
-    }
-    // [수정] isReadyForShuffle 대신 allWorkerEndpoints를 비워 다시 fetchGlobalState를 유도
+  // 실패 복구 시: Peer 정보만 초기화하여 다시 fetchGlobalState를 유도
+  private def resetShuffleData(): Unit = {
+    Logging.logInfo("Resetting Shuffle metadata (clearing peer endpoints)...")
     context.allWorkerEndpoints = List.empty
   }
 
@@ -182,6 +170,36 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     if (server != null) server.shutdown()
     if (channel != null) channel.shutdown()
     if (networkService != null) networkService.closeChannels()
+
+    cleanupTemporaryFiles()
+    Logging.logInfo("Shutdown complete.")
+  }
+
+  private def cleanupTemporaryFiles(): Unit = {
+    Logging.logInfo("Cleaning up temporary files (chunks & received data)...")
+    val outDir = new File(outputDir)
+
+    if (outDir.exists() && outDir.isDirectory) {
+      // temp_chunks 폴더 삭제
+      val tempChunksDir = new File(outDir, "temp_chunks")
+      if (tempChunksDir.exists()) {
+        deleteRecursively(tempChunksDir)
+      }
+
+      // partition_received_* 파일 삭제
+      utils.FileUtils.listFiles(outDir.getAbsolutePath).foreach { f =>
+        if (f.getName.startsWith("partition_received")) {
+          f.delete()
+        }
+      }
+    }
+  }
+
+  private def deleteRecursively(file: File): Unit = {
+    if (file.isDirectory) {
+      file.listFiles().foreach(deleteRecursively)
+    }
+    file.delete()
   }
 
   private def register(): WorkerState = {

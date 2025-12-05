@@ -120,12 +120,11 @@ class MasterState(numWorkers: Int) {
     if (isRecoveryCompletion) {
       Logging.logInfo(s"Worker $workerId completed recovery PARTITIONING. Signalling FAILURE to all workers to restart SHUFFLING.")
 
-      // 1. 전역 단계를 Shuffling으로 롤백 (재시작 지점)
-      currentPhase = Shuffling
-
-      // 2. 모든 워커 상태를 Failed로 변경 -> Alive 워커들이 Heartbeat로 감지하여 Shuffling 재시작
-      for (i <- workerStatus.indices) {
-        workerStatus(i) = Failed
+      if (!workerStatus.contains(Partitioning)) {
+        Logging.logInfo("Recovery complete. No workers in Partitioning. Resuming SHUFFLING phase.")
+        transitionToNextPhase(ProtoWorkerState.Partitioning)
+      } else {
+        Logging.logInfo(s"Worker $workerId recovered, but others are still Partitioning. Waiting...")
       }
 
     } else {
