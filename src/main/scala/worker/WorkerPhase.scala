@@ -137,6 +137,7 @@ class PartitioningPhase extends WorkerPhase {
 
 class ShufflePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): Unit = {
+    ctx.refreshGlobalState()
     Logging.logInfo("[Phase] Shuffling Started (Network Transfer)")
 
     val P = Constant.Size.partitionPerWorker
