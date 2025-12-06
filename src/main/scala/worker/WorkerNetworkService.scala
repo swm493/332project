@@ -10,7 +10,7 @@ import com.google.protobuf.ByteString
 import scala.concurrent.ExecutionContext
 import utils.{Logging, NodeAddress, PartitionID}
 
-class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(implicit ec: ExecutionContext)
+class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext)
   extends WorkerServiceGrpc.WorkerService {
 
   // --- Server Side ---
@@ -18,7 +18,7 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
   override def shuffle(responseObserver: StreamObserver[ShuffleReply]): StreamObserver[ShuffleRecord] = {
     new StreamObserver[ShuffleRecord] {
       override def onNext(req: ShuffleRecord): Unit = {
-        onDataReceived(req.partitionID, req.data.toByteArray)
+        context.handleReceivedData(req.partitionID, req.data.toByteArray)
       }
 
       override def onError(t: Throwable): Unit = {
@@ -37,20 +37,41 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
   private val channels = new ConcurrentHashMap[NodeAddress, ManagedChannel]()
   private val sendObservers = new ConcurrentHashMap[NodeAddress, StreamObserver[ShuffleRecord]]()
 
-  def sendData(targetAddress: NodeAddress, partitionID: PartitionID, data: Array[Byte]): Unit = {
-    try {
-      val observer = getOrCreateObserver(targetAddress)
-      observer.synchronized {
-        observer.onNext(ShuffleRecord(
-          data = ByteString.copyFrom(data),
-          partitionID = partitionID
-        ))
+  def sendData(targetWorkerId: Int, partitionID: PartitionID, data: Array[Byte]): Unit = {
+    var retries = 3
+    var success = false
+    var lastError: Throwable = null
+
+    while (retries > 0 && !success) {
+      val targetAddress = context.allWorkerEndpoints(targetWorkerId).address
+
+      try {
+        val observer = getOrCreateObserver(targetAddress)
+        observer.synchronized {
+          observer.onNext(ShuffleRecord(
+            data = ByteString.copyFrom(data),
+            partitionID = partitionID
+          ))
+        }
+        success = true
+      } catch {
+        case e: Exception =>
+          lastError = e
+          retries -= 1
+          Logging.logWarning(s"Send failed to Worker $targetWorkerId ($targetAddress). Retrying... ($retries left)")
+          
+          sendObservers.remove(targetAddress)
+          channels.remove(targetAddress)
+
+          if (retries > 0) {
+            try { Thread.sleep(500) } catch { case _: InterruptedException => }
+            context.refreshGlobalState()
+          }
       }
-    } catch {
-      case e: Exception =>
-        sendObservers.remove(targetAddress)
-        channels.remove(targetAddress)
-        throw new RuntimeException(s"Send failed to $targetAddress", e)
+    }
+
+    if (!success) {
+      throw new RuntimeException(s"Failed to send to Worker $targetWorkerId after retries", lastError)
     }
   }
 
@@ -64,7 +85,6 @@ class WorkerNetworkService(onDataReceived: (PartitionID, Array[Byte]) => Unit)(i
       stub.shuffle(new StreamObserver[ShuffleReply] {
         override def onNext(value: ShuffleReply): Unit = {}
         override def onError(t: Throwable): Unit = {
-          Logging.logWarning(s"Stream error to $addr: ${t.getMessage}")
           sendObservers.remove(addr)
         }
         override def onCompleted(): Unit = {}

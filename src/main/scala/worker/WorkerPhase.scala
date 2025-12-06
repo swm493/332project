@@ -203,7 +203,7 @@ class ShufflePhase extends WorkerPhase {
                   idxStream.writeInt(chunkBytes.length)
                 }
               } else {
-                ctx.networkService.sendData(targetEndpoint.address, seg.partitionId, chunkBytes)
+                ctx.networkService.sendData(targetWorkerIdx, seg.partitionId, chunkBytes)
               }
             }
           }

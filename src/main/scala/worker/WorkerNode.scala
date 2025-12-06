@@ -18,12 +18,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private var server: Server = _
 
-  private val onDataReceived = (partitionID: PartitionID, data: Array[Byte]) => {
-    Logging.logInfo(s"Received partition $partitionID data (${data.length} bytes)")
-    context.handleReceivedData(partitionID, data)
-  }
-
-  private val networkService = new WorkerNetworkService(onDataReceived)
+  private val networkService = new WorkerNetworkService(context)
 
   private val phases: Map[WorkerState, WorkerPhase] = Map(
     Sampling -> new SamplingPhase(),

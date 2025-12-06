@@ -68,6 +68,11 @@ class MasterState(numWorkers: Int) {
         case Shuffling | Merging =>
           Logging.logWarning(s"Worker $workerId recovered during $currentPhase. Assigning PARTITIONING to recover lost data.")
           workerStatus(workerId) = Partitioning
+          for (i <- workerStatus.indices if i != workerId) {
+            if (workerStatus(i) != Failed) { // 죽은 놈 빼고
+              workerStatus(i) = Waiting
+            }
+          }
           Partitioning
 
         case _ =>

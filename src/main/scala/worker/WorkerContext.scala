@@ -1,7 +1,7 @@
 package worker
 
 import sorting.master.*
-import utils.{Key, NodeAddress, WorkerEndpoint, IP, Port, PartitionID, NetworkUtils}
+import utils.{IP, Key, Logging, NetworkUtils, NodeAddress, PartitionID, Port, WorkerEndpoint}
 import utils.RecordOrdering.ordering.compare
 
 import java.util.concurrent.{ConcurrentLinkedQueue, Executors}
@@ -20,8 +20,8 @@ class WorkerContext(
 
   var myEndpoint: WorkerEndpoint = _
 
-  var allWorkerEndpoints: List[WorkerEndpoint] = List.empty
-  var splitters: List[Key] = List.empty
+  @volatile var allWorkerEndpoints: List[WorkerEndpoint] = List.empty
+  @volatile var splitters: List[Key] = List.empty
 
   var networkService: WorkerNetworkService = _
 
@@ -74,6 +74,32 @@ class WorkerContext(
       else left = mid + 1
     }
     left
+  }
+
+  // 마스터로부터 최신 주소록(Global State)을 가져오는 메서드
+  def refreshGlobalState(): Unit = {
+    try {
+      Logging.logInfo("[Context] Refreshing Global State from Master due to connection failure...")
+      val req = GetGlobalStateRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(myEndpoint)))
+      val res = masterClient.getGlobalState(req)
+
+      if (res.allWorkerEndpoints.nonEmpty) {
+        val oldList = allWorkerEndpoints
+        allWorkerEndpoints = res.allWorkerEndpoints.map(NetworkUtils.workerProtoToEndpoint).toList
+        Logging.logInfo(s"[Context] Global State Refreshed. Workers: ${allWorkerEndpoints.size}")
+
+        // (디버깅용) 바뀐 포트가 있는지 확인
+        if (oldList.nonEmpty && oldList.size == allWorkerEndpoints.size) {
+          for (i <- oldList.indices) {
+            if (oldList(i).address != allWorkerEndpoints(i).address) {
+              Logging.logEssential(s"Worker $i Address Changed: ${oldList(i).address} -> ${allWorkerEndpoints(i).address}")
+            }
+          }
+        }
+      }
+    } catch {
+      case e: Exception => Logging.logWarning(s"Failed to refresh global state: ${e.getMessage}")
+    }
   }
 
   def shutdown(): Unit = {
