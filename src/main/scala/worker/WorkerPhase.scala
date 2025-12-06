@@ -227,6 +227,7 @@ class ShufflePhase extends WorkerPhase {
 
       Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
     } finally {
+      Thread.sleep(10000)
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
       ctx.setCustomDataHandler(null)
