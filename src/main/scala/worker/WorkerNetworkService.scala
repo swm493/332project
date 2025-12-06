@@ -38,40 +38,30 @@ class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext
   private val sendObservers = new ConcurrentHashMap[NodeAddress, StreamObserver[ShuffleRecord]]()
 
   def sendData(targetWorkerId: Int, partitionID: PartitionID, data: Array[Byte]): Unit = {
-    var retries = 3
-    var success = false
-    var lastError: Throwable = null
+    val targetAddress = context.allWorkerEndpoints(targetWorkerId).address
 
-    while (retries > 0 && !success) {
-      val targetAddress = context.allWorkerEndpoints(targetWorkerId).address
-
-      try {
-        val observer = getOrCreateObserver(targetAddress)
-        observer.synchronized {
-          observer.onNext(ShuffleRecord(
-            data = ByteString.copyFrom(data),
-            partitionID = partitionID
-          ))
-        }
-        success = true
-      } catch {
-        case e: Exception =>
-          lastError = e
-          retries -= 1
-          Logging.logWarning(s"Send failed to Worker $targetWorkerId ($targetAddress). Retrying... ($retries left)")
-          
-          sendObservers.remove(targetAddress)
-          channels.remove(targetAddress)
-
-          if (retries > 0) {
-            try { Thread.sleep(500) } catch { case _: InterruptedException => }
-            context.refreshGlobalState()
-          }
+    try {
+      val observer = getOrCreateObserver(targetAddress)
+      observer.synchronized {
+        observer.onNext(ShuffleRecord(
+          data = ByteString.copyFrom(data),
+          partitionID = partitionID
+        ))
       }
-    }
+    } catch {
+      case e: Exception =>
+        Logging.logWarning(s"Send failed to Worker $targetWorkerId ($targetAddress). triggering Global Recovery...")
 
-    if (!success) {
-      throw new RuntimeException(s"Failed to send to Worker $targetWorkerId after retries", lastError)
+        sendObservers.remove(targetAddress)
+        channels.remove(targetAddress)
+
+        try {
+          context.refreshGlobalState()
+        } catch {
+          case _: Exception =>
+        }
+
+        throw new RuntimeException(s"Failed to send to Worker $targetWorkerId", e)
     }
   }
 
