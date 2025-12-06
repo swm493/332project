@@ -163,7 +163,7 @@ class ShufflePhase extends WorkerPhase {
       partitionIndexStreams(i) = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
     }
 
-    ctx.setCustomDataHandler { (pIdx, data) =>
+    def writeToStream(pIdx: PartitionID, data: Array[Byte]): Unit = {
       if (pIdx >= myStartIdx && pIdx < myEndIdx) {
         val stream = partitionStreams(pIdx)
         val idxStream = partitionIndexStreams(pIdx)
@@ -172,6 +172,17 @@ class ShufflePhase extends WorkerPhase {
           idxStream.writeInt(data.length)
         }
       }
+    }
+
+    ctx.setCustomDataHandler { (pIdx, data) =>
+      writeToStream(pIdx, data)
+    }
+
+    var pending = ctx.pollReceivedData()
+    while (pending.isDefined) {
+      val (pId, data) = pending.get
+      writeToStream(pId, data)
+      pending = ctx.pollReceivedData()
     }
 
     try {

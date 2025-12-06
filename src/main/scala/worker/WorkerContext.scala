@@ -33,7 +33,7 @@ class WorkerContext(
   // 파티션 ID는 Int (PartitionID)
   @volatile private var dataHandler: (PartitionID, Array[Byte]) => Unit = _
 
-  private val receivedDataQueue = new ConcurrentLinkedQueue[Array[Byte]]()
+  private val receivedDataQueue = new ConcurrentLinkedQueue[(PartitionID, Array[Byte])]()
 
   def updateSelfPort(port: Port): Unit = {
     selfAddress = NodeAddress(selfIP, port)
@@ -44,17 +44,17 @@ class WorkerContext(
       dataHandler(partitionID, data)
     } else {
       if (data != null && data.length > 0) {
-        receivedDataQueue.add(data)
+        receivedDataQueue.add((partitionID, data))
       }
     }
   }
 
-  def setCustomDataHandler(handler: (PartitionID, Array[Byte]) => Unit): Unit = {
-    this.dataHandler = handler
+  def pollReceivedData(): Option[(PartitionID, Array[Byte])] = {
+    Option(receivedDataQueue.poll())
   }
 
-  def getReceivedData: List[Array[Byte]] = {
-    receivedDataQueue.asScala.toList
+  def setCustomDataHandler(handler: (PartitionID, Array[Byte]) => Unit): Unit = {
+    this.dataHandler = handler
   }
 
   def isReadyForShuffle: Boolean = splitters.nonEmpty && allWorkerEndpoints.nonEmpty
