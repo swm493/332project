@@ -111,8 +111,6 @@ class MasterState(numWorkers: Int) {
   def handlePhaseComplete(workerId: ID, finishedPhase: ProtoWorkerState): Unit = synchronized {
     if (!isValidWorker(workerId)) return
 
-    if (workerStatus(workerId) == Failed) return
-
     workerStatus(workerId) = Waiting
     Logging.logInfo(s"Worker $workerId finished $finishedPhase and is now WAITING. (${countWaitingWorkers()}/$numWorkers)")
 
@@ -123,8 +121,8 @@ class MasterState(numWorkers: Int) {
         Logging.logInfo("Signalling FAILURE to all workers to restart SHUFFLING.")
         transitionToNextPhase(ProtoWorkerState.Partitioning)
         setAllWorkersState(Failed)
+        isRecovered = false
       }
-
     } else {
       if (countWaitingWorkers() == numWorkers) {
         transitionToNextPhase(finishedPhase)
