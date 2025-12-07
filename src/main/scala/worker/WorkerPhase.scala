@@ -168,9 +168,13 @@ class ShufflePhase extends WorkerPhase {
       if (pIdx >= myStartIdx && pIdx < myEndIdx) {
         val stream = partitionStreams(pIdx)
         val idxStream = partitionIndexStreams(pIdx)
-        stream.synchronized {
-          stream.write(data)
-          idxStream.writeInt(data.length)
+        try{
+          stream.synchronized {
+            stream.write(data)
+            idxStream.writeInt(data.length)
+          }
+        } catch {
+          case _: IOException => ctx.handleReceivedData(pIdx, data)
         }
       }
     }
@@ -208,12 +212,7 @@ class ShufflePhase extends WorkerPhase {
               raf.readFully(chunkBytes)
 
               if (targetEndpoint == ctx.myEndpoint) {
-                val stream = partitionStreams(seg.partitionId)
-                val idxStream = partitionIndexStreams(seg.partitionId)
-                stream.synchronized {
-                  stream.write(chunkBytes)
-                  idxStream.writeInt(chunkBytes.length)
-                }
+                writeToStream(seg.partitionId, chunkBytes)
               } else {
                 ctx.networkService.sendData(targetWorkerIdx, seg.partitionId, chunkBytes)
               }
@@ -228,9 +227,10 @@ class ShufflePhase extends WorkerPhase {
 
       Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
     } finally {
+      ctx.setCustomDataHandler(null)
+      Thread.sleep(1000)
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
-      ctx.setCustomDataHandler(null)
     }
   }
 
