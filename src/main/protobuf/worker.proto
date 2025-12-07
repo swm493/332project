@@ -4,6 +4,8 @@ package sorting;
 message ShuffleRecord {
   bytes data = 1; // 100 bytes record (키 + 값)
   int32 partitionID = 2;
+    bool isEOS = 3;
+    int32 senderID = 4;
 }
 
 message ShuffleReply {

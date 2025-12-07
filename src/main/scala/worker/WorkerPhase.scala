@@ -137,6 +137,7 @@ class PartitioningPhase extends WorkerPhase {
 
 class ShufflePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): Unit = {
+    ctx.clearShuffleStates()
     ctx.refreshGlobalState()
     Logging.logInfo("[Phase] Shuffling Started (Network Transfer)")
 
@@ -223,9 +224,20 @@ class ShufflePhase extends WorkerPhase {
         }
       }
 
+      Logging.logInfo("Data sending complete. Broadcasting EOS signals...")
+
+      ctx.allWorkerEndpoints.foreach { endpoint =>
+        if (endpoint.id == ctx.myEndpoint.id) {
+          ctx.markPeerFinished(ctx.myEndpoint.id)
+        } else {
+          ctx.networkService.sendEOS(endpoint.id)
+        }
+      }
+
       if (ctx.networkService != null) ctx.networkService.finishSending()
 
-      Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
+      Logging.logInfo("Waiting for all peers to finish shuffling (EOS Check)...")
+      ctx.waitForShuffleCompletion()
     } finally {
       ctx.setCustomDataHandler(null)
       Thread.sleep(1000)
@@ -251,26 +263,12 @@ class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Merging Started")
 
-    try {
-      Logging.logInfo("Waiting 3 seconds for late packets...")
-      Thread.sleep(3000)
-    } catch {
-      case _: InterruptedException =>
-    }
-
     val streamCache = scala.collection.mutable.Map[PartitionID, (BufferedOutputStream, DataOutputStream)]()
 
     try {
-      // WorkerContext.scala에 pollReceivedData가 구현되어 있어야 합니다.
-      // (이전 답변의 WorkerContext 수정사항 참고)
       var pending = ctx.pollReceivedData()
-      var count = 0
-
       while (pending.isDefined) {
         val (pId, data) = pending.get
-        count += 1
-
-        // 해당 파티션 파일에 'append' 모드로 열어서 씀
         val (bos, dos) = streamCache.getOrElseUpdate(pId, {
           val fData = new File(ctx.outputDir, s"partition_received_$pId")
           val fIndex = new File(ctx.outputDir, s"partition_received_$pId.index")
@@ -278,15 +276,10 @@ class MergePhase extends WorkerPhase {
           val d = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
           (b, d)
         })
-
         bos.write(data)
         dos.writeInt(data.length)
-
         pending = ctx.pollReceivedData()
       }
-
-      if (count > 0) Logging.logInfo(s"[MergePhase] Saved $count late records from queue.")
-
     } finally {
       streamCache.values.foreach { case (b, d) =>
         try {

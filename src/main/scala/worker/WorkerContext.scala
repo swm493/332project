@@ -4,7 +4,7 @@ import sorting.master.*
 import utils.{IP, Key, Logging, NetworkUtils, NodeAddress, PartitionID, Port, WorkerEndpoint}
 import utils.RecordOrdering.ordering.compare
 
-import java.util.concurrent.{ConcurrentLinkedQueue, Executors}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, Executors}
 import scala.concurrent.ExecutionContext
 import scala.jdk.CollectionConverters.*
 
@@ -35,6 +35,9 @@ class WorkerContext(
 
   private val receivedDataQueue = new ConcurrentLinkedQueue[(PartitionID, Array[Byte])]()
 
+  private val finishedShufflePeers = ConcurrentHashMap.newKeySet[Int]()
+  private val shuffleLock = new Object()
+
   def updateSelfPort(port: Port): Unit = {
     selfAddress = NodeAddress(selfIP, port)
   }
@@ -51,6 +54,14 @@ class WorkerContext(
 
   def pollReceivedData(): Option[(PartitionID, Array[Byte])] = {
     Option(receivedDataQueue.poll())
+  }
+
+  def clearReceivedData(): Unit = {
+    receivedDataQueue.clear()
+  }
+  
+  def enqueueDirectly(partitionID: PartitionID, data: Array[Byte]): Unit = {
+    receivedDataQueue.add((partitionID, data))
   }
 
   def setCustomDataHandler(handler: (PartitionID, Array[Byte]) => Unit): Unit = {
@@ -74,6 +85,35 @@ class WorkerContext(
       else left = mid + 1
     }
     left
+  }
+
+  def markPeerFinished(workerId: Int): Unit = {
+    finishedShufflePeers.add(workerId)
+    val current = finishedShufflePeers.size()
+    val total = allWorkerEndpoints.size
+
+    Logging.logInfo(s"[Shuffle] Worker $workerId finished sending. Progress: $current / $total")
+    
+    if (current >= total) {
+      shuffleLock.synchronized {
+        shuffleLock.notifyAll()
+      }
+    }
+  }
+  
+  def waitForShuffleCompletion(): Unit = {
+    shuffleLock.synchronized {
+      while (finishedShufflePeers.size() < allWorkerEndpoints.size) {
+        Logging.logInfo(s"[Shuffle] Waiting for peers... (${finishedShufflePeers.size()} / ${allWorkerEndpoints.size})")
+        shuffleLock.wait(1000)
+      }
+    }
+    Logging.logInfo("[Shuffle] All peers finished. Barrier Broken. Proceeding to Merge.")
+  }
+  
+  def clearShuffleStates(): Unit = {
+    finishedShufflePeers.clear()
+    clearReceivedData()
   }
 
   // 마스터로부터 최신 주소록(Global State)을 가져오는 메서드

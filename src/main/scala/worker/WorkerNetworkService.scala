@@ -18,7 +18,11 @@ class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext
   override def shuffle(responseObserver: StreamObserver[ShuffleReply]): StreamObserver[ShuffleRecord] = {
     new StreamObserver[ShuffleRecord] {
       override def onNext(req: ShuffleRecord): Unit = {
-        context.handleReceivedData(req.partitionID, req.data.toByteArray)
+        if(req.isEOS){
+          context.markPeerFinished(req.senderID)
+        }else{
+          context.handleReceivedData(req.partitionID, req.data.toByteArray)
+        }
       }
 
       override def onError(t: Throwable): Unit = {
@@ -45,7 +49,9 @@ class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext
       observer.synchronized {
         observer.onNext(ShuffleRecord(
           data = ByteString.copyFrom(data),
-          partitionID = partitionID
+          partitionID = partitionID,
+          isEOS = false,
+          senderID = context.myEndpoint.id
         ))
       }
     } catch {
@@ -62,6 +68,23 @@ class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext
         }
 
         throw new RuntimeException(s"Failed to send to Worker $targetWorkerId", e)
+    }
+  }
+
+  def sendEOS(targetWorkerId: Int): Unit = {
+    val targetAddress = context.allWorkerEndpoints(targetWorkerId).address
+    try {
+      val observer = getOrCreateObserver(targetAddress)
+      observer.synchronized {
+        observer.onNext(ShuffleRecord(
+          data = ByteString.EMPTY,
+          partitionID = -1,
+          isEOS = true,
+          senderID = context.myEndpoint.id
+        ))
+      }
+    } catch {
+      case e: Exception => Logging.logWarning(s"Failed to send EOS to $targetWorkerId: ${e.getMessage}")
     }
   }
 
