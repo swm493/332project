@@ -228,7 +228,6 @@ class ShufflePhase extends WorkerPhase {
 
       Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
     } finally {
-      Thread.sleep(10000)
       for (s <- partitionStreams) if (s != null) { s.flush(); s.close() }
       for (s <- partitionIndexStreams) if (s != null) { s.flush(); s.close() }
       ctx.setCustomDataHandler(null)
@@ -252,6 +251,57 @@ class MergePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): Unit = {
     Logging.logInfo("[Phase] Merging Started")
 
+    try {
+      Logging.logInfo("Waiting 3 seconds for late packets...")
+      Thread.sleep(3000)
+    } catch {
+      case _: InterruptedException =>
+    }
+
+    val streamCache = scala.collection.mutable.Map[PartitionID, (BufferedOutputStream, DataOutputStream)]()
+
+    try {
+      // WorkerContext.scala에 pollReceivedData가 구현되어 있어야 합니다.
+      // (이전 답변의 WorkerContext 수정사항 참고)
+      var pending = ctx.pollReceivedData()
+      var count = 0
+
+      while (pending.isDefined) {
+        val (pId, data) = pending.get
+        count += 1
+
+        // 해당 파티션 파일에 'append' 모드로 열어서 씀
+        val (bos, dos) = streamCache.getOrElseUpdate(pId, {
+          val fData = new File(ctx.outputDir, s"partition_received_$pId")
+          val fIndex = new File(ctx.outputDir, s"partition_received_$pId.index")
+          val b = new BufferedOutputStream(new FileOutputStream(fData, true))
+          val d = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(fIndex, true)))
+          (b, d)
+        })
+
+        bos.write(data)
+        dos.writeInt(data.length)
+
+        pending = ctx.pollReceivedData()
+      }
+
+      if (count > 0) Logging.logInfo(s"[MergePhase] Saved $count late records from queue.")
+
+    } finally {
+      streamCache.values.foreach { case (b, d) =>
+        try {
+          b.close()
+        } catch {
+          case _: Exception =>
+        }
+        try {
+          d.close()
+        } catch {
+          case _: Exception =>
+        }
+      }
+    }
+
     val P = Constant.Size.partitionPerWorker
     val myWorkerIdx = ctx.allWorkerEndpoints.indexOf(ctx.myEndpoint)
     val myStartIdx = myWorkerIdx * P
@@ -262,6 +312,8 @@ class MergePhase extends WorkerPhase {
         val dataFile = new File(ctx.outputDir, s"partition_received_$pId")
         val indexFile = new File(ctx.outputDir, s"partition_received_$pId.index")
         val finalFile = new File(ctx.outputDir, s"partition.$pId")
+
+        if (finalFile.exists()) finalFile.delete()
 
         if (dataFile.exists() && indexFile.exists()) {
           val chunkLengths = loadChunkLengths(indexFile)
