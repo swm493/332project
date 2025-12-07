@@ -1,7 +1,7 @@
 package worker
 
 import sorting.master.*
-import utils.{IP, Key, Logging, NetworkUtils, NodeAddress, PartitionID, Port, WorkerEndpoint}
+import utils.{IP, Key, Logging, NetworkUtils, NodeAddress, PartitionID, Port, WorkerEndpoint, Constant}
 import utils.RecordOrdering.ordering.compare
 
 import java.util.concurrent.{ConcurrentLinkedQueue, Executors}
@@ -35,17 +35,52 @@ class WorkerContext(
 
   private val receivedDataQueue = new ConcurrentLinkedQueue[(PartitionID, Array[Byte])]()
 
+  private var partitionSignalCounts: Array[Int] = _
+  private var finishedPartitions: Array[Boolean] = _
+  private val lock = new Object()
+
+  def initShuffleState(): Unit = {
+    val P = Constant.Size.partitionPerWorker
+    val totalPartitions = allWorkerEndpoints.length * P
+    partitionSignalCounts = new Array[Int](totalPartitions)
+    finishedPartitions = new Array[Boolean](totalPartitions)
+  }
+
   def updateSelfPort(port: Port): Unit = {
     selfAddress = NodeAddress(selfIP, port)
   }
 
   def handleReceivedData(partitionID: PartitionID, data: Array[Byte]): Unit = {
-    if (dataHandler != null) {
-      dataHandler(partitionID, data)
-    } else {
-      if (data != null && data.length > 0) {
-        receivedDataQueue.add((partitionID, data))
+    if (partitionID < 0) {
+      val realID = -(partitionID) - 1
+      lock.synchronized {
+        if (partitionSignalCounts != null && realID < partitionSignalCounts.length) {
+          partitionSignalCounts(realID) += 1
+
+          // 모든 워커(나 자신 포함)로부터 완료 신호를 받았다면 해당 파티션 완료 처리
+          // allWorkerEndpoints.length는 총 워커 수
+          if (partitionSignalCounts(realID) == allWorkerEndpoints.length) {
+            finishedPartitions(realID) = true
+            Logging.logInfo(s"[Shuffle] Partition $realID is fully received from all workers.")
+          }
+        }
       }
+    } else {
+      // 일반 데이터 처리
+      if (dataHandler != null) {
+        dataHandler(partitionID, data)
+      } else {
+        if (data != null && data.length > 0) {
+          receivedDataQueue.add((partitionID, data))
+        }
+      }
+    }
+  }
+
+  def isShuffleReceiveComplete(myStartIdx: Int, myEndIdx: Int): Boolean = {
+    lock.synchronized {
+      if (finishedPartitions == null) return false
+      (myStartIdx until myEndIdx).forall(idx => finishedPartitions(idx))
     }
   }
 

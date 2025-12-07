@@ -138,8 +138,9 @@ class PartitioningPhase extends WorkerPhase {
 class ShufflePhase extends WorkerPhase {
   override def execute(ctx: WorkerContext): Unit = {
     ctx.refreshGlobalState()
+    ctx.initShuffleState()
     Logging.logInfo("[Phase] Shuffling Started (Network Transfer)")
-
+    
     val P = Constant.Size.partitionPerWorker
     val totalPartitions = ctx.allWorkerEndpoints.length * P
 
@@ -223,9 +224,41 @@ class ShufflePhase extends WorkerPhase {
         }
       }
 
-      if (ctx.networkService != null) ctx.networkService.finishSending()
+      // 3. [Signal Logic] 모든 데이터 전송 완료 후, "전송 끝(Completion Signal)" 알림
+      Logging.logInfo("Data sending finished. Sending completion signals...")
+      for (pId <- 0 until totalPartitions) {
+        val targetWorkerIdx = pId / P
+        val signalId = -(pId + 1)
+        val emptyData = new Array[Byte](0) // 신호용 빈 바이트
 
-      Logging.logInfo("Sending complete. Keeping temporary chunks for potential rollback.")
+        if (targetWorkerIdx < ctx.allWorkerEndpoints.length) {
+          val targetEndpoint = ctx.allWorkerEndpoints(targetWorkerIdx)
+          if (targetEndpoint == ctx.myEndpoint) {
+            ctx.handleReceivedData(signalId, emptyData)
+          } else {
+            ctx.networkService.sendData(targetWorkerIdx, signalId, emptyData)
+          }
+        }
+      }
+
+      if (ctx.networkService != null) ctx.networkService.finishSending()
+      Logging.logInfo("All completion signals sent.")
+
+      Logging.logInfo(s"Waiting for completion signals for partitions $myStartIdx ~ ${myEndIdx - 1}...")
+
+      while (!ctx.isShuffleReceiveComplete(myStartIdx, myEndIdx)) {
+        var p = ctx.pollReceivedData()
+        while (p.isDefined) {
+          val (id, d) = p.get
+          if (id < 0) ctx.handleReceivedData(id, d)
+          else writeToStream(id, d)
+          p = ctx.pollReceivedData()
+        }
+        Thread.sleep(100) // Busy wait 방지
+      }
+
+      Logging.logInfo("Shuffle Receive Complete: All partitions received from all workers.")
+
     } finally {
       ctx.setCustomDataHandler(null)
       Thread.sleep(1000)

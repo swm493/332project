@@ -1,7 +1,4 @@
 package utils
-
-import java.net.{InetAddress, NetworkInterface}
-import scala.jdk.CollectionConverters._
 /**
  * 프로젝트 전체에서 사용되는 공통 타입과 상태를 정의합니다.
  */
