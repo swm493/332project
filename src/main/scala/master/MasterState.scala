@@ -15,6 +15,8 @@ class MasterState(numWorkers: Int) {
   private val workerSamples = mutable.Map[ID, List[Key]]()
   private val ipToId = mutable.Map[IP, ID]()
 
+  private var isRecovered : Boolean = false
+
   @volatile private var globalSplitters: List[Key] = _
 
   private var currentPhase: WorkerState = Unregistered
@@ -68,18 +70,13 @@ class MasterState(numWorkers: Int) {
         case Shuffling | Merging =>
           Logging.logWarning(s"Worker $workerId recovered during $currentPhase. Assigning PARTITIONING to recover lost data.")
           workerStatus(workerId) = Partitioning
-          for (i <- workerStatus.indices if i != workerId) {
-            if (workerStatus(i) != Failed) { // 죽은 놈 빼고
-              workerStatus(i) = Waiting
-            }
-          }
+          isRecovered = true
           Partitioning
 
         case _ =>
           workerStatus(workerId)
       }
     } else {
-      // 신규 등록은 기본적으로 Waiting
       Waiting
     }
 
@@ -114,26 +111,21 @@ class MasterState(numWorkers: Int) {
   def handlePhaseComplete(workerId: ID, finishedPhase: ProtoWorkerState): Unit = synchronized {
     if (!isValidWorker(workerId)) return
 
-    // [복구 완료 감지]
-    // 전역 상태는 Shuffling/Merging인데, 특정 워커가 Partitioning을 끝냈다면 이는 "복구 완료"를 의미.
-    val isRecoveryCompletion = (currentPhase == Shuffling || currentPhase == Merging) &&
-      (finishedPhase == ProtoWorkerState.Partitioning)
+    if (workerStatus(workerId) == Failed) return
 
     workerStatus(workerId) = Waiting
     Logging.logInfo(s"Worker $workerId finished $finishedPhase and is now WAITING. (${countWaitingWorkers()}/$numWorkers)")
 
-    if (isRecoveryCompletion) {
-      Logging.logInfo(s"Worker $workerId completed recovery PARTITIONING. Signalling FAILURE to all workers to restart SHUFFLING.")
+    if (isRecovered) {
+      Logging.logInfo(s"Worker $workerId completed recovery PARTITIONING.")
 
-      if (!workerStatus.contains(Partitioning)) {
-        Logging.logInfo("Recovery complete. No workers in Partitioning. Resuming SHUFFLING phase.")
+      if (countWaitingWorkers() == numWorkers) {
+        Logging.logInfo("Signalling FAILURE to all workers to restart SHUFFLING.")
         transitionToNextPhase(ProtoWorkerState.Partitioning)
-      } else {
-        Logging.logInfo(s"Worker $workerId recovered, but others are still Partitioning. Waiting...")
+        setAllWorkersState(Failed)
       }
 
     } else {
-      // 정상 진행: 모든 워커가 Waiting이면 다음 단계로 전이
       if (countWaitingWorkers() == numWorkers) {
         transitionToNextPhase(finishedPhase)
       }

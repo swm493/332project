@@ -71,17 +71,14 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             Thread.sleep(1000)
             currentState = pollHeartbeat()
 
-          // [수정] Failed 시 Shuffling 복구 로직
           case Failed =>
             Logging.logSevere("Master signalled FAILURE. Rolling back to restart SHUFFLING Phase...")
 
-            // 파일 삭제는 ShufflePhase 진입 시 자동 수행되므로, 여기서는 메모리 상태만 리셋
             resetShuffleData()
 
             Logging.logInfo("State reset complete. Forcing state to Shuffling...")
             Thread.sleep(2000)
 
-            // 2. Shuffling 단계부터 바로 재시작
             currentState = Shuffling
 
           case s if phases.contains(s) =>
