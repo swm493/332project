@@ -1,4 +1,4 @@
-package services
+package utils
 
 import java.net.{InetAddress, NetworkInterface}
 import scala.jdk.CollectionConverters._
@@ -34,11 +34,6 @@ object Constant {
   object Sample {
     def n: Int = 1000
   }
-
-  object Ports {
-    def MasterWorkerPort: Port = 1557
-    def WorkerWorkerPort: Port = 6974
-  }
 }
 
 object RecordOrdering {
@@ -70,27 +65,5 @@ object WorkerState extends Enumeration {
    * Done: 모든 작업 완료
    * Failed: 작업 중 실패 (마스터가 감지)
    */
-  val Unregistered, Sampling, Shuffling, Merging, Done, Failed, Waiting = Value
-}
-
-object NetworkUtils {
-  def findLocalIpAddress(): IP = {
-    try {
-      NetworkInterface.getNetworkInterfaces.asScala
-        .filter(i => !i.isLoopback && i.isUp)
-        .flatMap(_.getInetAddresses.asScala)
-        .find(addr => addr.isSiteLocalAddress)
-        .map(_.getHostAddress)
-        .getOrElse(InetAddress.getLocalHost.getHostAddress)
-    } catch {
-      case _: Exception => "Unknown-IP"
-    }
-  }
-
-  def workerEndpointToProto(domain: services.WorkerEndpoint): sorting.common.WorkerEndpoint = {
-    sorting.common.WorkerEndpoint(
-      id = domain.id.toString,
-      address = Some(sorting.common.NodeAddress(domain.address.ip, domain.address.port))
-    )
-  }
+  val Unregistered, Sampling, Partitioning, Shuffling, Merging, Done, Failed, Waiting = Value
 }

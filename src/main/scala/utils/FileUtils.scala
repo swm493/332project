@@ -1,11 +1,11 @@
-package services
+package utils
 
 import java.io.*
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import scala.util.{Try, Using}
 
-object StorageService {// 파일 쓰기 동기화를 위한 락 객체
+object FileUtils {// 파일 쓰기 동기화를 위한 락 객체
   private val writeLock = new Object()
   
   def extractSamples(file: File): List[Key] = {
@@ -118,7 +118,7 @@ object StorageService {// 파일 쓰기 동기화를 위한 락 객체
 
     try {
       // 3. SortingService에 '데이터 소스'와 '쓰기 콜백' 전달
-      MergeService.merge(
+      MergeUtils.merge(
         inputs = inputIterators,
         writeOutput = (record: Array[Byte]) => bos.write(record)
       )

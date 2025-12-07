@@ -23,30 +23,21 @@ message SampleReply {
   bool ack = 1;
 }
 
-message NotifyRequest {
-  WorkerEndpoint workerEndpoint = 1;
-  string message = 2;
-}
-
-message NotifyReply {
-  bool ack = 1;
-}
-
 message HeartbeatRequest {
   WorkerEndpoint workerEndpoint = 1;
 }
 
 message HeartbeatReply {
-  enum WorkerHeartState {
-    Unregistered = 0;
-    Sampling = 1;
-    Shuffling = 2;
-    Merging = 3;
-    Done = 4;
-    Failed = 5;
-    Waiting = 6;
-  }
-  WorkerHeartState state = 1;
+  ProtoWorkerState state = 1;
+}
+
+message PhaseCompleteRequest {
+  WorkerEndpoint workerEndpoint = 1;
+  ProtoWorkerState phase = 2;
+}
+
+message PhaseCompleteReply {
+  bool ack = 1;
 }
 
 message GetGlobalStateRequest {
@@ -58,14 +49,6 @@ message GetGlobalStateReply {
   repeated WorkerEndpoint allWorkerEndpoints = 2;
 }
 
-message ShuffleReadyRequest {
-  WorkerEndpoint workerEndpoint = 1;
-}
-
-message ShuffleReadyReply {
-  bool allReady = 1;
-}
-
 service MasterService {
   rpc RegisterWorker (RegisterRequest) returns (RegisterReply);
   rpc SubmitSamples (SampleRequest) returns (SampleReply);
@@ -73,8 +56,5 @@ service MasterService {
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc GetGlobalState (GetGlobalStateRequest) returns (GetGlobalStateReply);
 
-  rpc CheckShuffleReady (ShuffleReadyRequest) returns (ShuffleReadyReply);
-
-  rpc NotifyShuffleComplete (NotifyRequest) returns (NotifyReply);
-  rpc NotifyMergeComplete (NotifyRequest) returns (NotifyReply);
+  rpc NotifyPhaseComplete (PhaseCompleteRequest) returns (PhaseCompleteReply);
 }

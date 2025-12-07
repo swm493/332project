@@ -1,19 +1,15 @@
 package worker
 
 import io.grpc.{ManagedChannelBuilder, Server, ServerBuilder}
-import java.util.logging.Logger
 import scala.concurrent.ExecutionContext
-import services.WorkerState
-import services.WorkerState.*
-import sorting.common.*
-import sorting.master.*
-import services.Constant.Ports
-import sorting.worker.*
-import services.{PartitionID, Port, NetworkUtils}
+import utils.{Logging, NetworkUtils, PartitionID, Port, WorkerState}
+import utils.WorkerState._
+import sorting.common._
+import sorting.master._
+import sorting.worker._
+import java.io.File
 
 class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: String)(implicit ec: ExecutionContext) {
-  private val logger = Logger.getLogger(classOf[WorkerNode].getName)
-
   private val Array(host, port) = masterAddress.split(":")
   private val channel = ManagedChannelBuilder.forAddress(host, port.toInt).usePlaintext().build
   private val masterClient = MasterServiceGrpc.blockingStub(channel)
@@ -22,15 +18,11 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private var server: Server = _
 
-  private val onDataReceived = (partitionID: PartitionID, data: Array[Byte]) => {
-    logger.info(s"Received partition $partitionID data (${data.length} bytes)")
-    context.handleReceivedData(partitionID, data)
-  }
-
-  private val networkService = new WorkerNetworkService(onDataReceived)
+  private val networkService = new WorkerNetworkService(context)
 
   private val phases: Map[WorkerState, WorkerPhase] = Map(
     Sampling -> new SamplingPhase(),
+    Partitioning -> new PartitioningPhase(),
     Shuffling -> new ShufflePhase(),
     Merging -> new MergePhase()
   )
@@ -43,11 +35,10 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       .build
       .start()
 
-    val actualPort: Port = server.getPort()
+    val actualPort: Port = server.getPort
     context.updateSelfPort(actualPort)
 
-    logger.info(s"Worker server started on ${context.selfAddress}")
-    logger.info(s"Worker connecting to Master at $masterAddress")
+    Logging.logEssential(s"Worker server started on ${context.selfAddress}")
 
     try {
       runWorkerLoop()
@@ -64,13 +55,13 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
         currentState = register()
       } catch {
         case e: Exception =>
-          logger.warning(s"Failed to register with Master (${masterAddress}): ${e.getMessage}")
-          logger.info("Retrying in 5 seconds...")
+          Logging.logWarning(s"Failed to register with Master ($masterAddress): ${e.getMessage}")
+          Logging.logInfo("Retrying in 5 seconds...")
           try { Thread.sleep(5000) } catch { case _: InterruptedException => }
       }
     }
 
-    while (currentState != Done && currentState != Failed) {
+    while (currentState != Done) {
       try {
         currentState match {
           case Unregistered =>
@@ -80,27 +71,53 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
             Thread.sleep(1000)
             currentState = pollHeartbeat()
 
+          case Failed =>
+            Logging.logSevere("Master signalled FAILURE. Rolling back to restart SHUFFLING Phase...")
+
+            resetShuffleData()
+
+            Logging.logInfo("State reset complete. Forcing state to Shuffling...")
+            Thread.sleep(2000)
+
+            currentState = Shuffling
+
           case s if phases.contains(s) =>
+            if (s == Partitioning && context.splitters.isEmpty) {
+              Logging.logInfo("Fetching global state for splitters...")
+              fetchGlobalState()
+            }
             if (s == Shuffling && !context.isReadyForShuffle) {
+              Logging.logInfo("Fetching global state for shuffle peers...")
               fetchGlobalState()
             }
 
-            if (s != Shuffling || context.isReadyForShuffle) {
-              val nextExpected = phases(s).execute(context)
-              waitForState(nextExpected)
-              currentState = nextExpected
+            val canExecute = s match {
+              case Partitioning => context.splitters.nonEmpty
+              case Shuffling => context.isReadyForShuffle
+              case _ => true
+            }
+
+            if (canExecute) {
+              phases(s).execute(context)
+              notifyMasterPhaseComplete(s)
+              currentState = Waiting
             } else {
               Thread.sleep(1000)
               currentState = pollHeartbeat()
             }
 
           case _ =>
-            logger.warning(s"Unknown state: $currentState")
+            Logging.logWarning(s"Unknown state: $currentState")
             Thread.sleep(1000)
+            currentState = pollHeartbeat()
         }
       } catch {
+        case e: RuntimeException if e.getMessage.contains("Master signaled Failed") =>
+          Logging.logWarning("Detected Failure signal during wait. Rolling back...")
+          currentState = Failed
+
         case e: Exception =>
-          logger.severe(s"Error in loop: ${e.getMessage}")
+          Logging.logSevere(s"Error in loop: ${e.getMessage}")
           e.printStackTrace()
           Thread.sleep(5000)
           currentState = pollHeartbeat()
@@ -108,12 +125,73 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     }
   }
 
+  // 실패 복구 시: Peer 정보만 초기화하여 다시 fetchGlobalState를 유도
+  private def resetShuffleData(): Unit = {
+    Logging.logInfo("Resetting Shuffle metadata (clearing peer endpoints)...")
+    context.allWorkerEndpoints = List.empty
+  }
+
+  private def notifyMasterPhaseComplete(state: WorkerState): Unit = {
+    val myEndpointProto = NetworkUtils.workerEndpointToProto(context.myEndpoint)
+
+    val protoPhase = state match {
+      case Sampling     => ProtoWorkerState.Sampling
+      case Partitioning => ProtoWorkerState.Partitioning
+      case Shuffling    => ProtoWorkerState.Shuffling
+      case Merging      => ProtoWorkerState.Merging
+      case _            => ProtoWorkerState.Unregistered
+    }
+
+    if (protoPhase != ProtoWorkerState.Unregistered) {
+      Logging.logInfo(s"[$state] Local task done. Sending PhaseComplete($protoPhase) to Master...")
+      try {
+        masterClient.notifyPhaseComplete(PhaseCompleteRequest(
+          workerEndpoint = Some(myEndpointProto),
+          phase = protoPhase
+        ))
+        Logging.logInfo(s"[$state] Master acknowledged phase completion.")
+      } catch {
+        case e: Exception => Logging.logWarning(s"Failed to notify phase complete: ${e.getMessage}")
+      }
+    }
+  }
+
   private def stop(): Unit = {
-    logger.info("Worker shutting down...")
+    Logging.logInfo("Worker shutting down...")
     if (context != null) context.shutdown()
     if (server != null) server.shutdown()
     if (channel != null) channel.shutdown()
     if (networkService != null) networkService.closeChannels()
+
+    cleanupTemporaryFiles()
+    Logging.logInfo("Shutdown complete.")
+  }
+
+  private def cleanupTemporaryFiles(): Unit = {
+    Logging.logInfo("Cleaning up temporary files (chunks & received data)...")
+    val outDir = new File(outputDir)
+
+    if (outDir.exists() && outDir.isDirectory) {
+      // temp_chunks 폴더 삭제
+      val tempChunksDir = new File(outDir, "temp_chunks")
+      if (tempChunksDir.exists()) {
+        deleteRecursively(tempChunksDir)
+      }
+
+      // partition_received_* 파일 삭제
+      utils.FileUtils.listFiles(outDir.getAbsolutePath).foreach { f =>
+        if (f.getName.startsWith("partition_received")) {
+          f.delete()
+        }
+      }
+    }
+  }
+
+  private def deleteRecursively(file: File): Unit = {
+    if (file.isDirectory) {
+      file.listFiles().foreach(deleteRecursively)
+    }
+    file.delete()
   }
 
   private def register(): WorkerState = {
@@ -123,8 +201,8 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
     val res = masterClient.registerWorker(req)
 
     if (res.workerEndpoint.isDefined) {
-      context.myEndpoint = toDomain(res.workerEndpoint.get)
-      logger.info(s"Registered as Worker ID ${context.myEndpoint.id}")
+      context.myEndpoint = NetworkUtils.workerProtoToEndpoint(res.workerEndpoint.get)
+      Logging.logEssential(s"Registered as Worker ID ${context.myEndpoint.id}")
     }
 
     updateContextData(res.splitters, res.allWorkerEndpoints)
@@ -139,19 +217,16 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
 
   private def fetchGlobalState(): Unit = {
     try {
+      Logging.logInfo(s"[fetchGlobalState] Requesting state for myEndpoint: ${context.myEndpoint}")
       val req = GetGlobalStateRequest(workerEndpoint = Some(NetworkUtils.workerEndpointToProto(context.myEndpoint)))
       val res = masterClient.getGlobalState(req)
+      val splittersCount = if (res.splitters != null) res.splitters.size else "null"
+      val workersCount = if (res.allWorkerEndpoints != null) res.allWorkerEndpoints.size else "null"
+      Logging.logInfo(s"[fetchGlobalState] Received -> Splitters: $splittersCount, Workers: $workersCount")
       updateContextData(res.splitters, res.allWorkerEndpoints)
+      Logging.logInfo("[fetchGlobalState] Context updated successfully.")
     } catch {
-      case e: Exception => logger.warning(s"Failed to fetch global state: ${e.getMessage}")
-    }
-  }
-
-  private def waitForState(target: WorkerState): Unit = {
-    var s = pollHeartbeat()
-    while(s != target && s != Done && s != Failed) {
-      Thread.sleep(1000)
-      s = pollHeartbeat()
+      case e: Exception => Logging.logWarning(s"Failed to fetch global state: ${e.getMessage}")
     }
   }
 
@@ -160,12 +235,7 @@ class WorkerNode(val masterAddress: String, inputDirs: List[String], outputDir: 
       context.splitters = splitters.map(_.key.toByteArray).toList
     }
     if (endpoints.nonEmpty) {
-      context.allWorkerEndpoints = endpoints.map(toDomain).toList
+      context.allWorkerEndpoints = endpoints.map(NetworkUtils.workerProtoToEndpoint).toList
     }
-  }
-
-  private def toDomain(proto: sorting.common.WorkerEndpoint): services.WorkerEndpoint = {
-    val addr = proto.address.get
-    services.WorkerEndpoint(proto.id.toInt, services.NodeAddress(addr.ip, addr.port))
   }
 }

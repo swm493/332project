@@ -3,10 +3,11 @@ package worker
 import java.io.File
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.ExecutionContext.Implicits.global
+import utils.Logging
 
 /**
  * WorkerApp: 워커를 실행하는 메인 프로그램
- * "worker <master IP:port> -I <input directory> ... -O <output directory>"
+ * worker <master IP:port> -I <input dir1> ... -O <output dir> [-d | --debug]
  */
 object WorkerApp {
 
@@ -18,9 +19,22 @@ object WorkerApp {
 
   def main(args: Array[String]): Unit = {
 
-    val config = parseArgs(args)
+    // 디버그 옵션 확인 및 설정
+    val debugArgIndex = args.indexWhere(arg => arg == "-d" || arg == "--debug")
+    if (debugArgIndex != -1) {
+      Logging.debugMode = true
+      println("[Worker] Debug mode enabled.")
+    } else {
+      Logging.debugMode = false
+      println("[Worker] Debug mode disabled.")
+    }
+
+    // 디버그 옵션을 제외한 인자들만 파싱
+    val filteredArgs = args.filterNot(arg => arg == "-d" || arg == "--debug")
+
+    val config = parseArgs(filteredArgs)
     if (config.isEmpty) {
-      System.err.println("Usage: worker <master IP:port> -I <input dir1> [<input dir2> ...] -O <output dir>")
+      System.err.println("Usage: worker <master IP:port> -I <input dir1> [<input dir2> ...] -O <output dir> [-d | --debug]")
       System.exit(1)
     }
 
@@ -35,9 +49,8 @@ object WorkerApp {
     workerNode.start()
   }
 
-  // (project.sorting.2025.pptx)의 복잡한 인자 파서
   private def parseArgs(args: Array[String]): Option[Config] = {
-    if (args.length < 5) return None // "worker", "master", "-I", "in", "-O", "out"
+    if (args.length < 5) return None
 
     try {
       var masterAddress = ""

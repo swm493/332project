@@ -2,24 +2,18 @@ package master
 
 import scala.concurrent.{ExecutionContext, Future}
 import com.google.protobuf.ByteString
-import services.NetworkUtils
+import utils.{Logging, NetworkUtils}
 
-import java.util.logging.Logger
-
-// 프로젝트 의존성
-import services.{Key, ID}
-import services.WorkerState._
+import utils.{Key, ID}
 import sorting.master._
 import sorting.common._
 
 class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
   extends MasterServiceGrpc.MasterService {
 
-  private val logger = Logger.getLogger(classOf[MasterNetworkService].getName)
-
   override def registerWorker(req: RegisterRequest): Future[RegisterReply] = {
     val protoAddress = req.workerAddress.getOrElse(throw new IllegalArgumentException("Worker address is missing"))
-    val domainAddress = services.NodeAddress(protoAddress.ip, protoAddress.port)
+    val domainAddress = utils.NodeAddress(protoAddress.ip, protoAddress.port)
 
     val (assignedState, splitters, myDomainEndpoint, allDomainEndpoints) = state.registerWorker(domainAddress)
 
@@ -36,10 +30,9 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     val workerId: ID = domainEndpoint.id
 
     val s = state.getWorkerStatus(workerId)
-    val responseState = s match {
-      case Shuffling if !state.isShufflingReady => HeartbeatReply.WorkerHeartState.Waiting
-      case _ => HeartbeatReply.WorkerHeartState.fromName(s.toString).getOrElse(HeartbeatReply.WorkerHeartState.Unregistered)
-    }
+
+    val responseState = ProtoWorkerState.fromName(s.toString).getOrElse(ProtoWorkerState.Unregistered)
+
     Future.successful(HeartbeatReply(state = responseState))
   }
 
@@ -51,12 +44,6 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     ))
   }
 
-  override def checkShuffleReady(req: ShuffleReadyRequest): Future[ShuffleReadyReply] = {
-    val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
-    val isSuccess = if (workerId != -1) state.waitForShuffleReady(workerId) else false
-    Future.successful(ShuffleReadyReply(allReady = isSuccess))
-  }
-
   override def submitSamples(req: SampleRequest): Future[SampleReply] = {
     val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
     val samples = req.samples.map(_.key.toByteArray).toList
@@ -64,26 +51,27 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     Future.successful(SampleReply(ack = true))
   }
 
-  override def notifyShuffleComplete(req: NotifyRequest): Future[NotifyReply] = {
+  override def notifyPhaseComplete(req: PhaseCompleteRequest): Future[PhaseCompleteReply] = {
     val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
-    if (workerId != -1) state.updateShuffleStatus(workerId)
-    Future.successful(NotifyReply(ack = true))
-  }
+    val phase = req.phase
 
-  override def notifyMergeComplete(req: NotifyRequest): Future[NotifyReply] = {
-    val workerId: ID = req.workerEndpoint.map(toDomainEndpoint).map(_.id).getOrElse(-1)
     if (workerId != -1) {
-      state.updateMergeStatus(workerId)
-      if (state.isAllWorkersFinished) scheduleShutdown()
+      state.handlePhaseComplete(workerId, phase)
+
+      // Merging이 끝나고 Done 상태가 되어 셧다운이 필요한지 체크
+      if (state.isAllWorkersFinished) {
+        scheduleShutdown()
+      }
     }
-    Future.successful(NotifyReply(ack = true))
+
+    Future.successful(PhaseCompleteReply(ack = true))
   }
 
   private def scheduleShutdown(): Unit = {
     new Thread(() => {
       try {
-        Thread.sleep(2000)
-        logger.info("Master shutting down now.")
+        Thread.sleep(3000) // 모든 워커가 마지막 Heartbeat(Done)를 받을 시간을 줌
+        Logging.logInfo("All tasks completed. Master shutting down now.")
         System.exit(0)
       } catch { case e: InterruptedException => e.printStackTrace() }
     }).start()
@@ -94,11 +82,11 @@ class MasterNetworkService(state: MasterState)(implicit ec: ExecutionContext)
     else keys.map(k => ProtoKey(ByteString.copyFrom(k)))
   }
 
-  private def toDomainEndpoint(proto: sorting.common.WorkerEndpoint): services.WorkerEndpoint = {
+  private def toDomainEndpoint(proto: sorting.common.WorkerEndpoint): utils.WorkerEndpoint = {
     val protoAddress = proto.address.getOrElse(throw new IllegalArgumentException("Address is missing"))
-    services.WorkerEndpoint(
+    utils.WorkerEndpoint(
       id = proto.id.toInt,
-      address = services.NodeAddress(protoAddress.ip, protoAddress.port)
+      address = utils.NodeAddress(protoAddress.ip, protoAddress.port)
     )
   }
 }
