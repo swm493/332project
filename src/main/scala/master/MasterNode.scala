@@ -16,6 +16,7 @@ class MasterNode(executionContext: ExecutionContext, val numWorkers: Int) {
   def start(): Unit = {
     server = ServerBuilder.forPort(0)
       .addService(MasterServiceGrpc.bindService(networkService, executionContext))
+      .maxInboundMessageSize(64 * 1024 * 1024)
       .build
       .start
 

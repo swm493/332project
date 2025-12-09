@@ -67,7 +67,10 @@ class WorkerNetworkService(context: WorkerContext)(implicit ec: ExecutionContext
 
   private def getOrCreateObserver(target: NodeAddress): StreamObserver[ShuffleRecord] = {
     channels.computeIfAbsent(target, addr => {
-      ManagedChannelBuilder.forAddress(addr.ip, addr.port).usePlaintext().build()
+      ManagedChannelBuilder.forAddress(addr.ip, addr.port)
+        .usePlaintext()
+        .maxInboundMessageSize(64 * 1024 * 1024)
+        .build()
     })
 
     sendObservers.computeIfAbsent(target, addr => {
