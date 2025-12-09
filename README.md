@@ -1,5 +1,35 @@
 # 332project
 
+## Requirement
+- java 1.8 (JDK 8u202)
+- scala 3.3.7
+- sbt 1.11.7
+## How To Build
+1. use this command to compile executable java file.
+```bash
+sbt clean assembly
+```
+2. move to where compiled file exist.
+```bash
+$ cd target/scala-3.3.7/
+$ ls
+332project-assembly-0.1.0-SNAPSHOT.jar
+```
+3. move this file to where master and worker nodes exist.
+```bash
+scp -P [port] 332project-assembly-0.1.0-SNAPSHOT.jar [master/worker address]
+```
+4. excute program with these command.
+```bash
+# master
+java -cp 332project-assembly-0.1.0-SNAPSHOT.jar master.MasterApp <num of workers> [-d | --debug]
+```
+```bash
+# worker
+java -cp 332project-assembly-0.1.0-SNAPSHOT.jar worker.WorkerApp <master IP:port> -I <input dir1> [<input dir2> ...] -O <output dir> [-d | --debug]
+```
+you can use debug mode with `-d` to see the more specific log in master and worker's process.
+
 ## :pushpin: Description
 
 TBD
